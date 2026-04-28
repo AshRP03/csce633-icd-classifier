@@ -1,0 +1,23 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Model cache
+*.bin
+*.safetensors
+*.h5
+
+# Data files — never commit MIMIC-III data
+*.csv
+*.tsv
+*.json
+data/
+
+# HuggingFace cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
