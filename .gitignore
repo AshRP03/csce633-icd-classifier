@@ -9,11 +9,16 @@ __pycache__/
 *.safetensors
 *.h5
 
-# Data files — never commit MIMIC-III data
-*.csv
-*.tsv
-*.json
-data/
+# MIMIC-III data — never commit
+mimiciii/
+
+# Generated files
+pseudo_labeled.csv
+checkpoints/
+predictions/
+
+# Instructor support files (keep local, not in repo)
+support_materials/
 
 # HuggingFace cache
 .cache/
