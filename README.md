@@ -1,4 +1,4 @@
-# CSCE 633 — ICD Codability Classifier
+# CSCE 633 - ICD Codability Classifier
 
 Binary sentence classifier that predicts whether a sentence from a clinical note contains ICD-codable medical information.
 
@@ -32,5 +32,5 @@ python model.py   # downloads ClinicalBERT and runs a sanity check forward pass
 ## Notes
 
 - Max input length: 128 tokens (per project spec)
-- Fully offline inference — no external APIs
+- Fully offline inference; no external APIs
 - MIMIC-III data is excluded from this repo per course policy
