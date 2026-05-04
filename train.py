@@ -1,23 +1,35 @@
 """
-Training loop — rewritten.
+Two-phase fine-tuning loop for the codability classifier.
 
-Key changes vs original:
-  * GOLD_OVERSAMPLE 50 → 4 (was 10% of training set, massive overfit)
-  * Phase 3 "gold calibration" disabled by default (was destroying the model:
-    in the original run, gold acc went 0.85 → 0.75 → 0.75 across epochs and
-    the buggy `best_score = -1.0` init saved the worst checkpoint as "best")
-  * Validation is now a blend of held-out pseudo + a held-out chunk of gold.
-    We never train on the gold-validation slice, so the validation signal
-    actually predicts test performance instead of over-estimating it.
-  * Threshold tuning uses BOTH the pseudo-val and the held-out gold split,
-    weighted toward gold (by repeating gold samples in the tuning set).
-  * Tunes over [0.30, 0.70] without artificial clipping. The reason the
-    original needed clipping was that Phase 3 was destroying probability
-    calibration; with Phase 3 gone, full-range tuning is fine.
-  * Sliding-window aggregation switched from "max" to "mean_topk" with k=3
-    (configurable via config.DOC_AGG / config.DOC_TOPK).
-  * Gold examples are no longer dumped into training in mass quantity. They
-    serve primarily as held-out validation + threshold calibration.
+Inputs:  pseudo_labeled.csv (from data_pipeline.run_pipeline) and the 20 gold
+         examples from train_data-text_and_labels.csv.
+
+Outputs:
+  checkpoints/best_model.pt      — best model weights, by validation score
+  checkpoints/threshold.json     — tuned decision threshold
+  checkpoints/gold_embeddings.npy — embeddings of all 20 gold examples
+  checkpoints/gold_labels.npy    — corresponding labels
+  (the last two files are consumed by predict.py for the KNN-against-gold
+   inference path)
+
+Validation strategy:
+  - Stratified split: 4 gold/class go into training (oversampled GOLD_OVERSAMPLE×),
+    6 gold/class are held out as a clean validation set.
+  - Best-checkpoint selection blends a held-out pseudo-val signal (1k examples,
+    cheap to evaluate) with the gold-val signal (12 examples, very small but
+    aligned with the test distribution). 70% gold weight, 30% pseudo.
+
+Two phases:
+  Phase 1: head-only training on top of a frozen encoder. Lets the head adapt
+           without disturbing the pretrained embeddings.
+  Phase 2: unfreeze the top UNFREEZE_TOP_N encoder layers + pooler. Smaller LR.
+           This is where most of the task-specific adaptation happens.
+
+Threshold tuning:
+  Decision threshold is grid-searched over [0.30, 0.70] on a blend of pseudo-val
+  + gold-val (gold weighted ~50%). If gold-only and pseudo-only optima diverge
+  by >0.15, the result is leaned toward gold because gold is the closest data we
+  have to the test distribution.
 """
 
 import json
@@ -33,11 +45,27 @@ from model import ClinicalBERTClassifier, load_tokenizer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Datasets / loaders
+# Word truncation (enforce MAX_WORDS limit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _truncate_to_max_words(text: str, max_words: int = None) -> str:
+    """Truncate text to max_words. Defaults to config.MAX_WORDS if not specified."""
+    if max_words is None:
+        max_words = int(getattr(config, "MAX_WORDS", 128))
+    if not text or max_words <= 0:
+        return text
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset / inference helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SentenceDataset(Dataset):
-    """Pre-tokenized fixed-length dataset for fast training."""
+    """Pre-tokenized fixed-length dataset for fast batched training."""
     def __init__(self, texts, labels, tokenizer):
         self.encodings = tokenizer(
             texts, max_length=config.MAX_LENGTH,
@@ -55,11 +83,8 @@ class SentenceDataset(Dataset):
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference helpers (training-time evaluation)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _aggregate_window_probs(probs: list[float]) -> float:
+    """Combine per-window probabilities into one fragment-level probability."""
     if not probs:
         return 0.0
     agg = str(getattr(config, "DOC_AGG", "mean_topk")).lower()
@@ -75,7 +100,7 @@ def _aggregate_window_probs(probs: list[float]) -> float:
 
 
 def _predict_prob_class1_raw(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
-    """Raw probabilities from a pre-tokenized loader (no sliding window)."""
+    """Predict class-1 probability from a pre-tokenized loader (single window)."""
     model.eval()
     y_true, p1 = [], []
     with torch.no_grad():
@@ -89,7 +114,7 @@ def _predict_prob_class1_raw(model, loader, device) -> tuple[np.ndarray, np.ndar
 
 
 def _predict_prob_class1_texts(model, tokenizer, texts, device) -> np.ndarray:
-    """Sliding-window inference with chosen aggregation."""
+    """Sliding-window inference for long texts, with chosen aggregation."""
     model.eval()
     stride = int(getattr(config, "DOC_STRIDE", 64))
     bs     = int(getattr(config, "BATCH_SIZE", 16))
@@ -126,14 +151,10 @@ def evaluate(model, tokenizer, texts, labels, device, threshold) -> tuple[float,
     return acc, f1, rep
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Threshold tuning
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _tune_threshold(y_true: np.ndarray, p1: np.ndarray,
                     thr_min: float = 0.30, thr_max: float = 0.70,
                     n_steps: int = 81) -> tuple[float, float]:
-    """Grid-search threshold maximising 0.4·acc + 0.6·F1. Returns (thr, score)."""
+    """Grid search the threshold maximising 0.4*acc + 0.6*F1."""
     best_thr, best_score = 0.5, -1.0
     for thr in np.linspace(thr_min, thr_max, n_steps):
         preds = (p1 >= thr).astype(int)
@@ -144,11 +165,8 @@ def _tune_threshold(y_true: np.ndarray, p1: np.ndarray,
     return best_thr, best_score
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_epoch(model, loader, optimizer, criterion, device) -> float:
+    """One training epoch. Gradient-clipping at norm=1 to stabilize Phase 2."""
     model.train()
     total = 0.0
     for batch in loader:
@@ -171,47 +189,22 @@ def _load_gold():
     lc = next(c for c in df.columns if "label" in c)
     df = df[[tc, lc]].rename(columns={tc: "text", lc: "label"})
     df["label"] = df["label"].astype(int)
+    # Enforce MAX_WORDS limit on gold examples
+    df["text"] = df["text"].apply(_truncate_to_max_words)
     return df
 
 
-def train_model(pseudo_csv=None,
-                seed_override: int | None = None,
-                checkpoint_name: str = "best_model.pt",
-                gold_train_per_class: int = 4,
-                unfreeze_top_n: int | None = None):
-    """
-    Train one model. For ensemble training, call this multiple times with
-    different (seed_override, checkpoint_name, gold_train_per_class,
-    unfreeze_top_n) to produce diverse models.
+# ─────────────────────────────────────────────────────────────────────────────
+# Main training entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Args:
-        pseudo_csv: path to the pseudo-labeled CSV (default: config.PSEUDO_LABEL_CSV).
-        seed_override: if set, replaces config.RANDOM_SEED for this run.
-            Affects data shuffling, validation split, and weight init.
-        checkpoint_name: filename inside config.CHECKPOINTS to save best model.
-        gold_train_per_class: how many gold examples per class to put in the
-            training set (rest go to validation). Default 4 (=8 train, 12 val).
-        unfreeze_top_n: how many encoder layers to unfreeze in Phase 2.
-            Default None means use config.UNFREEZE_TOP_N.
-    """
+def train_model(pseudo_csv=None):
     config.CHECKPOINTS.mkdir(exist_ok=True)
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Train] Device: {device}")
     tokenizer = load_tokenizer()
 
-    # Apply per-model overrides
-    seed = seed_override if seed_override is not None else config.RANDOM_SEED
-    n_unfreeze = unfreeze_top_n if unfreeze_top_n is not None else config.UNFREEZE_TOP_N
-    print(f"[Train] seed={seed}, checkpoint={checkpoint_name}, "
-          f"gold_train_per_class={gold_train_per_class}, unfreeze_top_n={n_unfreeze}")
-
-    # Set numpy/torch seeds for reproducibility within this run
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # ── Load data ───────────────────────────────────────────────────────────
     gold_df = _load_gold()
     gold_text_set = set(gold_df["text"].tolist())
 
@@ -219,42 +212,39 @@ def train_model(pseudo_csv=None,
     full_df["label"] = full_df["label"].astype(int)
     pseudo_df = full_df[~full_df["text"].isin(gold_text_set)].reset_index(drop=True)
     pseudo_df = pseudo_df.drop_duplicates(subset=["text"]).reset_index(drop=True)
-    pseudo_df = pseudo_df.sample(frac=1, random_state=seed) \
-                          .reset_index(drop=True)
+    pseudo_df = pseudo_df.sample(frac=1, random_state=config.RANDOM_SEED).reset_index(drop=True)
     print(f"[Train] Pseudo (non-gold, deduped): {len(pseudo_df):,} rows")
     print(f"[Train] Pseudo class balance — "
           f"class0: {(pseudo_df['label']==0).sum():,} "
           f"class1: {(pseudo_df['label']==1).sum():,}")
 
-    # ── Splits ────────────────────────────────────────────────────────────────
-    # Pseudo split
+    # ── Splits ──────────────────────────────────────────────────────────────
     n_val_pseudo = max(200, int(len(pseudo_df) * float(getattr(config, "PSEUDO_VAL_SPLIT", 0.10))))
     pseudo_val   = pseudo_df.iloc[:n_val_pseudo].reset_index(drop=True)
     pseudo_train = pseudo_df.iloc[n_val_pseudo:].reset_index(drop=True)
 
-    # Stratified gold split: gold_train_per_class per class in training,
-    # rest in validation. Default 4/class → 8 train, 12 val.
-    rng = np.random.RandomState(seed)
+    # Stratified gold split: 4 of each class to training, 6 of each held out.
+    rng = np.random.RandomState(config.RANDOM_SEED)
     gold_idx_by_class = {c: list(gold_df.index[gold_df["label"]==c]) for c in (0, 1)}
     for c in gold_idx_by_class:
         rng.shuffle(gold_idx_by_class[c])
 
     gold_val_idx, gold_tr_idx = [], []
     for c, idxs in gold_idx_by_class.items():
-        gold_tr_idx.extend(idxs[:gold_train_per_class])
-        gold_val_idx.extend(idxs[gold_train_per_class:])
+        gold_tr_idx.extend(idxs[:4])
+        gold_val_idx.extend(idxs[4:])
 
     gold_val   = gold_df.loc[gold_val_idx].reset_index(drop=True)
     gold_train = gold_df.loc[gold_tr_idx].reset_index(drop=True)
     print(f"[Train] Gold split: train={len(gold_train)}, val={len(gold_val)}")
 
-    # Mild gold oversampling
+    # Mild oversampling of training-gold (3× of 8 = 24 rows in the training set,
+    # alongside ~10k pseudo rows — small enough not to overfit).
     gold_oversample = int(getattr(config, "GOLD_OVERSAMPLE", 3))
     gold_repeated = pd.concat([gold_train] * gold_oversample, ignore_index=True)
 
     train_df = pd.concat([pseudo_train, gold_repeated], ignore_index=True)
-    train_df = train_df.sample(frac=1, random_state=seed) \
-                       .reset_index(drop=True)
+    train_df = train_df.sample(frac=1, random_state=config.RANDOM_SEED).reset_index(drop=True)
 
     print(f"[Train] Training set: {len(train_df):,} "
           f"({len(pseudo_train):,} pseudo + {len(gold_repeated):,} gold "
@@ -264,7 +254,7 @@ def train_model(pseudo_csv=None,
           f"class0: {(train_df['label']==0).sum():,} "
           f"class1: {(train_df['label']==1).sum():,}")
 
-    # ── Loaders ───────────────────────────────────────────────────────────────
+    # ── Loaders ─────────────────────────────────────────────────────────────
     train_loader = DataLoader(
         SentenceDataset(train_df["text"].tolist(), train_df["label"].tolist(), tokenizer),
         batch_size=config.BATCH_SIZE, shuffle=True)
@@ -272,7 +262,7 @@ def train_model(pseudo_csv=None,
         SentenceDataset(pseudo_val["text"].tolist(), pseudo_val["label"].tolist(), tokenizer),
         batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
+    # ── Loss ────────────────────────────────────────────────────────────────
     cw = getattr(config, "CLASS_WEIGHTS", None)
     if cw is not None:
         weight = torch.tensor(cw, dtype=torch.float32, device=device)
@@ -281,12 +271,10 @@ def train_model(pseudo_csv=None,
     else:
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    best_ckpt = config.CHECKPOINTS / checkpoint_name
+    best_ckpt = config.CHECKPOINTS / "best_model.pt"
     PATIENCE  = 4
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Phase 1: head-only
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Phase 1: head only ──────────────────────────────────────────────────
     print("\n── Phase 1: head only (encoder frozen) ──")
     model = ClinicalBERTClassifier(dropout=config.DROPOUT, freeze_encoder=True).to(device)
     optim = torch.optim.AdamW(
@@ -297,13 +285,13 @@ def train_model(pseudo_csv=None,
     for epoch in range(1, config.PHASE1_EPOCHS + 1):
         loss = run_epoch(model, train_loader, optim, criterion, device)
 
-        # Pseudo-val signal (cheap)
+        # Cheap pseudo-val signal (single forward pass, no sliding window)
         y_pv, p1_pv = _predict_prob_class1_raw(model, pseudo_val_loader, device)
         pv_preds = (p1_pv >= 0.5).astype(int)
         pv_acc = accuracy_score(y_pv, pv_preds)
         pv_f1  = f1_score(y_pv, pv_preds, zero_division=0)
 
-        # Gold-val signal (the one that matters; small but expensive due to sliding window)
+        # Expensive but aligned gold-val signal (sliding window)
         gv_acc, gv_f1, _ = evaluate(model, tokenizer, gold_val["text"].tolist(),
                                      gold_val["label"].tolist(), device, 0.5)
 
@@ -323,12 +311,10 @@ def train_model(pseudo_csv=None,
 
     print(f"Phase 1 best score: {best_score:.3f}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Phase 2: unfreeze top layers
-    # ─────────────────────────────────────────────────────────────────────────
-    print(f"\n── Phase 2: fine-tune top {n_unfreeze} encoder layers ──")
+    # ── Phase 2: unfreeze top encoder layers ────────────────────────────────
+    print(f"\n── Phase 2: fine-tune top {config.UNFREEZE_TOP_N} encoder layers ──")
     model.load_state_dict(torch.load(best_ckpt, map_location=device))
-    model.unfreeze_top_layers(n_unfreeze)
+    model.unfreeze_top_layers(config.UNFREEZE_TOP_N)
     optim = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=config.PHASE2_LR, weight_decay=0.05)
@@ -362,89 +348,24 @@ def train_model(pseudo_csv=None,
     print(f"Phase 2 best score: {best_score:.3f}")
     model.load_state_dict(torch.load(best_ckpt, map_location=device))
 
-    # Diagnostic eval on FULL gold set (both train and val portions)
-    full_gold_acc, full_gold_f1, full_gold_rep = evaluate(
-        model, tokenizer, gold_df["text"].tolist(),
-        gold_df["label"].tolist(), device, 0.5)
-    print(f"\n[Diag] Full gold @ 0.5: acc={full_gold_acc:.3f} f1={full_gold_f1:.3f}")
-    print(full_gold_rep)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Phase 3 (optional): gold calibration — DISABLED by default.
-    # If you re-enable, the implementation below avoids the original bugs:
-    #   * best_score initialised properly
-    #   * tiny LR (1e-6 by default)
-    #   * very few epochs
-    #   * tracks held-out gold_val (not training gold)
-    # ─────────────────────────────────────────────────────────────────────────
-    calibrate_epochs = int(getattr(config, "GOLD_CALIB_EPOCHS", 0))
-    if calibrate_epochs > 0 and len(gold_train) > 0:
-        print(f"\n── Phase 3: gold calibration ({calibrate_epochs} epochs) ──")
-        gold_loader = DataLoader(
-            SentenceDataset(gold_train["text"].tolist() * 5,
-                            gold_train["label"].tolist() * 5, tokenizer),
-            batch_size=4, shuffle=True)
-
-        model.unfreeze_top_layers(n_unfreeze)
-        for p in model.classifier.parameters():
-            p.requires_grad = True
-
-        calib_optim = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=float(getattr(config, "GOLD_CALIB_LR", 1e-6)),
-            weight_decay=0.01)
-
-        # Initialise best with current model's gold-val score (proper init!)
-        gv_acc0, gv_f10, _ = evaluate(model, tokenizer, gold_val["text"].tolist(),
-                                       gold_val["label"].tolist(), device, 0.5)
-        best_gv = 0.4*gv_acc0 + 0.6*gv_f10
-        no_imp = 0
-        print(f"  baseline gv: acc={gv_acc0:.3f} f1={gv_f10:.3f} score={best_gv:.3f}")
-
-        for epoch in range(1, calibrate_epochs + 1):
-            loss = run_epoch(model, gold_loader, calib_optim, criterion, device)
-            gv_acc, gv_f1, _ = evaluate(model, tokenizer, gold_val["text"].tolist(),
-                                         gold_val["label"].tolist(), device, 0.5)
-            s = 0.4*gv_acc + 0.6*gv_f1
-            print(f"  E{epoch:02d} loss={loss:.4f} gv_acc={gv_acc:.3f} "
-                  f"gv_f1={gv_f1:.3f} score={s:.3f}")
-            if s > best_gv:
-                best_gv, no_imp = s, 0
-                torch.save(model.state_dict(), best_ckpt)
-                print("    ✓ saved")
-            else:
-                no_imp += 1
-                if no_imp >= 2:
-                    print("    early stop"); break
-
-        model.load_state_dict(torch.load(best_ckpt, map_location=device))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Threshold tuning — on a BLEND of held-out pseudo + held-out gold
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Threshold tuning on blended pseudo-val + gold-val ───────────────────
+    # Use sliding-window inference for pseudo-val (fair comparison with how
+    # test fragments are evaluated by predict.py).
     print("\n── Threshold tuning (blended pseudo-val + gold-val) ──")
 
-    # Get probs on pseudo-val (sliding window for fair comparison with test)
     p1_pv = _predict_prob_class1_texts(model, tokenizer,
                                         pseudo_val["text"].tolist(), device)
     y_pv  = np.array(pseudo_val["label"].tolist(), int)
-
-    # Get probs on gold-val (now the FULL 20 gold)
     p1_gv = _predict_prob_class1_texts(model, tokenizer,
                                         gold_val["text"].tolist(), device)
     y_gv  = np.array(gold_val["label"].tolist(), int)
 
-    # ROUND 2: weight gold harder. Gold is the only data point that actually
-    # resembles the test distribution; pseudo is structurally biased toward
-    # whatever the section regex caught. Weight gold so it counts ~50% in the
-    # blend (was 25%).
+    # Repeat gold so it carries ~50% weight in the blend
     gold_weight = max(1, len(p1_pv) // (2 * max(1, len(p1_gv))))
     p1_blend = np.concatenate([p1_pv] + [p1_gv] * gold_weight)
     y_blend  = np.concatenate([y_pv]  + [y_gv]  * gold_weight)
 
     thr, sc = _tune_threshold(y_blend, p1_blend, thr_min=0.30, thr_max=0.70)
-
-    # Also compute the pseudo-only and gold-only optima for visibility
     thr_p, sc_p = _tune_threshold(y_pv, p1_pv, thr_min=0.30, thr_max=0.70)
     thr_g, sc_g = _tune_threshold(y_gv, p1_gv, thr_min=0.30, thr_max=0.70)
 
@@ -453,10 +374,9 @@ def train_model(pseudo_csv=None,
     print(f"  BLEND      opt: thr={thr:.2f} score={sc:.3f}  "
           f"(gold_weight={gold_weight})")
 
-    # Sanity: if gold-val threshold differs wildly from pseudo, lean toward gold.
-    # (Round 1 used average; round 2 leans gold because we now have full 20.)
+    # If the two optima diverge a lot, lean toward gold (closer to test distribution).
     if abs(thr_g - thr_p) > 0.15:
-        thr = round((2 * thr_g + thr_p) / 3, 2)   # 2/3 gold + 1/3 pseudo
+        thr = round((2 * thr_g + thr_p) / 3, 2)
         print(f"  (gold and pseudo diverge → leaning toward gold: thr={thr:.2f})")
 
     thr_path = config.CHECKPOINTS / "threshold.json"
@@ -468,37 +388,16 @@ def train_model(pseudo_csv=None,
                    f, indent=2)
     print(f"[Train] Tuned threshold {thr:.2f} → {thr_path}")
 
-    # ── DIAGNOSTIC: per-row gold predictions ──────────────────────────────
-    # Always written. Lets us see exactly which gold examples the model is
-    # failing on, even without a separate predict-side debug step.
-    diag_path = config.CHECKPOINTS / "gold_diagnostic.csv"
-    diag_df = pd.DataFrame({
-        "text":      gold_val["text"].tolist(),
-        "true_label":  y_gv,
-        "prob_class1": p1_gv.round(4),
-        "pred_at_thr": (p1_gv >= thr).astype(int),
-        "correct":     ((p1_gv >= thr).astype(int) == y_gv).astype(int),
-    })
-    # Truncate text in CSV for readability
-    diag_df["text"] = diag_df["text"].str.slice(0, 200) + "..."
-    diag_df.to_csv(diag_path, index=False)
-    print(f"[Train] Wrote per-row gold diagnostic → {diag_path}")
-    print(f"[Train] Gold mistakes by class: "
-          f"FN (pred 0, true 1): {((diag_df['pred_at_thr']==0) & (diag_df['true_label']==1)).sum()}, "
-          f"FP (pred 1, true 0): {((diag_df['pred_at_thr']==1) & (diag_df['true_label']==0)).sum()}")
-    print(f"[Train] Tuned threshold {thr:.2f} → {thr_path}")
-
     g_acc, g_f1, _ = evaluate(model, tokenizer, gold_df["text"].tolist(),
                                gold_df["label"].tolist(), device, thr)
     print(f"[Train] Full gold @ tuned thr: acc={g_acc:.3f} f1={g_f1:.3f}")
 
-    # ── Save gold embeddings for KNN-against-gold inference (round 6) ──────
-    # Compute pre-classifier embeddings for ALL 20 gold examples and save them.
-    # predict.py loads these and does a KNN lookup at inference time to use
-    # gold information that the classifier alone might miss.
+    # ── Save gold embeddings for KNN-against-gold inference ─────────────────
+    # predict.py loads these and computes cosine similarity between each test
+    # fragment's embedding and these to find nearest gold neighbours.
     print("[Train] Computing & saving gold embeddings for KNN inference...")
     model.eval()
-    all_gold_texts = gold_df["text"].tolist()
+    all_gold_texts  = gold_df["text"].tolist()
     all_gold_labels = np.array(gold_df["label"].tolist(), dtype=int)
     gold_embeds = []
     with torch.no_grad():
@@ -512,7 +411,7 @@ def train_model(pseudo_csv=None,
             mask = enc["attention_mask"].to(device)
             emb = model.embed(ids, mask).cpu().numpy()
             gold_embeds.append(emb)
-    gold_embeds = np.concatenate(gold_embeds, axis=0)   # (20, 768)
+    gold_embeds = np.concatenate(gold_embeds, axis=0)
     np.save(config.CHECKPOINTS / "gold_embeddings.npy", gold_embeds)
     np.save(config.CHECKPOINTS / "gold_labels.npy", all_gold_labels)
     print(f"[Train] Saved gold embeddings: shape={gold_embeds.shape} → "

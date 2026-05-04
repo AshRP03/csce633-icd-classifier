@@ -1,38 +1,46 @@
 """
-Data pipeline — rewritten to FIX the train/test distribution mismatch.
+Pseudo-labelled training data pipeline.
 
-OLD PIPELINE (broken):
-  Stage 5a: sentence-level pseudo via regex score.
-  Stage 5b: discharge=1 / radiology=0 — WRONG: many discharge sections are
-            class 0 (Discharge Medications, Discharge Instructions, etc.) and
-            many radiology IMPRESSIONS are class 1 (positive findings).
+The 20 hand-labelled gold examples are too few to train BERT directly. This
+pipeline builds ~10k pseudo-labelled fragments from MIMIC-III that look like
+gold (in style and length) and labels them by structural rules.
 
-NEW PIPELINE:
-  Stage 1   : ICD vocabulary (kept).
-  Stage 2   : Filter NOTEEVENTS (kept).
-  Stage 3   : Sentence splitting (kept, only used by 5a).
-  Stage 4   : Heuristic sentence labeler (kept; thresholds tightened).
-  Stage 5a  : Sentence-level pseudo-labels (kept, count reduced).
-  Stage 5c  : NEW — Section-anchored fragment pseudo-labels.
-              Class 1 from: Discharge Diagnosis, Active Issues, Hospital Course
-                            "# Disease:" headers, Past Medical History, Major
-                            Surgical Procedure, positive imaging IMPRESSIONS.
-              Class 0 from: Discharge Medications, Discharge Instructions,
-                            Patient Education, negative/stable IMPRESSIONS,
-                            Social/Family History without disease, micro/lab
-                            result dumps, pure procedural narratives.
-  Stage 5d  : NEW — TF-IDF nearest-neighbor mining anchored to 20 gold examples.
-              For each gold example, retrieve top-K similar candidate fragments
-              from MIMIC and propagate the gold label.
+Pipeline stages:
 
-Output: pseudo_labeled.csv with text,label columns. Gold examples are appended
-last so train.py can find them by exact text match.
+  1. Build an ICD vocabulary from the diagnosis/procedure tables, used as a
+     lexical signal for the regex labeler in stage 5a.
+
+  2. Load NOTEEVENTS (filtered to relevant categories, drop ISERROR rows).
+
+  3. Sentence splitting (with a heuristic fallback if punkt isn't available).
+
+  4. Heuristic sentence labeler — assigns class 1 / class 0 / discard based on
+     accumulated regex evidence. Used only for stage 5a.
+
+  5a. Sentence-level pseudo-labels. Walk notes, take sentences the labeler
+      classifies confidently. ~3000 short examples per class.
+
+  5c. Section-anchored fragment pseudo-labels. Anchor on section headers
+      inside discharge summaries (Discharge Diagnosis, PMH, Brief Hospital
+      Course, etc.) and label the surrounding ~100-word window by section
+      type. Imaging IMPRESSIONs are content-classified (positive findings →
+      class 1, negative/stable → class 0). ~6000 fragments total.
+
+  5d. Bio_ClinicalBERT semantic neighbour mining. For each gold example,
+      embed it and find the nearest fragments in MIMIC by cosine similarity.
+      Propagate the gold label. Then mine HARD NEGATIVES: fragments that
+      look semantically similar to a class-1 gold but contain class-0
+      narrative cues (planning/disposition language) → label class 0. These
+      teach the model the "looks codable but isn't" distinction that is the
+      hardest part of the task.
+
+The combined pseudo dataset (~10k rows) plus a few oversampled gold examples
+is what train.py fits on.
 """
 
 import re
 import random
 import hashlib
-from pathlib import Path
 
 import nltk
 import numpy as np
@@ -44,9 +52,10 @@ import config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — ICD vocabulary
+# Stage 1: ICD vocabulary
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Common medical filler words that bloat the vocabulary without adding signal.
 _MEDICAL_STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "in", "with", "for", "due",
     "to", "not", "nos", "nec", "other", "unspecified", "without", "type",
@@ -57,7 +66,22 @@ _MEDICAL_STOPWORDS = {
 }
 
 
+def _truncate_to_max_words(text: str, max_words: int = None) -> str:
+    """Truncate text to max_words. Defaults to config.MAX_WORDS if not specified."""
+    if max_words is None:
+        max_words = int(getattr(config, "MAX_WORDS", 128))
+    if not text or max_words <= 0:
+        return text
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
 def build_icd_term_set() -> frozenset:
+    """Tokenize all ICD diagnosis/procedure titles into a lowercase term set.
+    Used by the sentence labeler — sentences with high ICD-term overlap are
+    weak positive evidence."""
     dfs = []
     for path in (config.ICD_DIAGNOSES_CSV, config.ICD_PROCEDURES_CSV):
         df = pd.read_csv(path, usecols=["SHORT_TITLE", "LONG_TITLE"], dtype=str)
@@ -75,10 +99,11 @@ def build_icd_term_set() -> frozenset:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 2 — NOTEEVENTS loader (unchanged)
+# Stage 2: Note loader
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_noteevents(categories=None, max_n=None) -> pd.DataFrame:
+    """Read NOTEEVENTS, drop error rows, filter by category, optionally sample."""
     cats = categories or config.NOTE_CATEGORIES
     print(f"[Stage 2] Reading NOTEEVENTS for categories: {cats}")
     df = pd.read_csv(
@@ -99,10 +124,13 @@ def load_noteevents(categories=None, max_n=None) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3 — Sentence splitting
+# Stage 3: Sentence splitting
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_sentences(text: str) -> list[str]:
+    """Sentence-split with NLTK punkt; fall back to a simple regex split if
+    punkt isn't downloaded. Filters to sentences of 5–64 words to skip
+    fragments that are too short to label or too long to be sentence-like."""
     try:
         nltk.data.find("tokenizers/punkt")
         sents = nltk.sent_tokenize(text)
@@ -112,14 +140,23 @@ def split_sentences(text: str) -> list[str]:
     for s in sents:
         s = s.strip()
         n = len(s.split())
-        if 5 <= n <= 64:   # keep sentence-sized
+        if 5 <= n <= 64:
             out.append(s)
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 4 — Heuristic sentence labeler (kept; thresholds tightened)
+# Stage 4: Heuristic sentence labeler
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Cumulative-evidence scorer. Negative patterns subtract; positive patterns
+# add. Scores ≥ 4 → class 1, ≤ -2 → class 0, else discard.
+#
+# Strong negative patterns (subtract): hedged/negative findings, code-status
+# directives, patient instructions, vital signs / lab values, social history.
+# Strong positive patterns (add): named procedures, cardiac rhythms, named
+# diseases, diagnosis framing ("history of", "consistent with", etc.).
+# Plus weak signal from ICD vocabulary overlap.
 
 _PURE_NUMERIC = re.compile(r"^\s*[\d\.\,\s:/\-]+\s*$")
 _HEADER_PATTERN = re.compile(r"^[A-Z][A-Z\s\-/]{3,}:\s*$|^\s*[A-Z][A-Z\s]{3,}\s*$")
@@ -195,7 +232,7 @@ _CARDIAC_RHYTHM = re.compile(
 
 
 def label_sentence(sentence: str, icd_terms: frozenset) -> int | None:
-    """Score-based labeler. Returns 1, 0, or None (discard)."""
+    """Cumulative-evidence labeler. Returns 1, 0, or None (discard / ambiguous)."""
     if _PURE_NUMERIC.match(sentence):
         return 0
     if _HEADER_PATTERN.match(sentence):
@@ -205,22 +242,19 @@ def label_sentence(sentence: str, icd_terms: frozenset) -> int | None:
         return None
 
     score = 0
-
-    # Strong negatives
+    # Negatives
     if _NEG_FINDING.search(sentence):       score -= 4
     if _CARE_DIRECTIVE.search(sentence):    score -= 4
     if _PATIENT_INSTRUCTION.search(sentence): score -= 4
     if _MED_ADMIN.search(sentence):         score -= 2
     if _VITALS_LABS.search(sentence):       score -= 2
     if _SOCIAL_FAMILY.search(sentence):     score -= 3
-
-    # Strong positives
+    # Positives
     if _PROCEDURE_STRONG.search(sentence):  score += 4
     if _CARDIAC_RHYTHM.search(sentence):    score += 4
     if _CONDITION.search(sentence):         score += 3
     if _DIAGNOSIS_FRAMING.search(sentence): score += 2
-
-    # ICD term overlap
+    # ICD vocabulary overlap (weak signal)
     words = set(re.findall(r"[a-zA-Z]+", sentence.lower()))
     overlap = len(words & icd_terms)
     if overlap >= 4:    score += 3
@@ -228,14 +262,16 @@ def label_sentence(sentence: str, icd_terms: frozenset) -> int | None:
 
     if score >= 4:    return 1
     if score <= -2:   return 0
-    return None
+    return None  # ambiguous → discard
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 5a — Sentence-level pseudo-labels (unchanged structure, smaller count)
+# Stage 5a: Sentence-level pseudo-labels
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sentence_pseudo(notes_df: pd.DataFrame, icd_terms: frozenset) -> pd.DataFrame:
+    """Walk notes, sentence-split, label each sentence. Stop when the per-class
+    cap is reached. Output is balanced (same count per class)."""
     n_per_class = config.MAX_PER_CLASS
     class1, class0 = [], []
     seen = set()
@@ -260,31 +296,32 @@ def build_sentence_pseudo(notes_df: pd.DataFrame, icd_terms: frozenset) -> pd.Da
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 5c — Section-anchored fragment pseudo-labels  (THE BIG FIX)
+# Stage 5c: Section-anchored fragment pseudo-labels
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Strategy:  Don't use note CATEGORY as the label signal. Instead, find specific
-# named sections within a note and label by section type. This matches how the
-# 20 gold examples were actually labeled (we verified by inspection).
+# Walk every note. For each named section (Discharge Diagnosis, PMH, Surgical
+# Procedure, HPI, Brief Hospital Course, Discharge Medications, Discharge
+# Instructions, etc.) extract a ~100-word window starting at the header and
+# label by section type. This produces fragments that look like the gold
+# examples in both length and structure.
 #
-# Each section regex captures an anchor; we extract from the anchor up to a
-# target word count. This produces fragments that look like the gold examples.
-# ─────────────────────────────────────────────────────────────────────────────
+# For Radiology notes we also content-classify the IMPRESSION block:
+#   strong positive findings → class 1
+#   negative/stable findings  → class 0
+# That gives the model both kinds of imaging signal.
 
-# CLASS 1 section anchors  (codable: name diseases / procedures / problems)
+# Class 1 anchors — fragments starting at these headers usually evidence diagnoses
 _SEC1_DISCHARGE_DX = re.compile(
     r"(discharge\s+diagnosis|primary\s+diagnosis|principal\s+diagnosis|"
-    r"admitting\s+diagnosis|secondary\s+diagnosis|active\s+issues|"
-    r"problem\s+list)\s*[:\n]",
+    r"admitting\s+diagnosis|secondary\s+diagnosis|active\s+issues|problem\s+list)\s*[:\n]",
     re.IGNORECASE,
 )
+# `# Disease:` problem-anchored hospital course chunks
 _SEC1_HOSPITAL_COURSE_PROBLEM = re.compile(
-    # "# Cardiogenic Shock:" style problem-anchored hospital course chunks
     r"(?:^|\n)\s*#+\s*[A-Z][A-Za-z][^\n]{2,80}:\s",
 )
 _SEC1_PMH = re.compile(
-    r"(past\s+medical\s+history|pmh|cardiac\s+history|"
-    r"medical\s+history)\s*[:\n]",
+    r"(past\s+medical\s+history|pmh|cardiac\s+history|medical\s+history)\s*[:\n]",
     re.IGNORECASE,
 )
 _SEC1_SURGICAL = re.compile(
@@ -301,15 +338,7 @@ _SEC1_BRIEF_HOSPITAL_COURSE = re.compile(
     re.IGNORECASE,
 )
 
-# A second `#` header within the next ~80 words is a sign of a *multi-problem*
-# narrative chunk — looks like row 8 from the test, which is class 0.
-# A single `#` header followed by sustained narrative is a focused problem
-# block (class 1, like the gold "# Cardiogenic Shock:" example).
-_MULTI_HASH_NEXT80 = re.compile(
-    r"(?:^|\n)\s*#+\s*[A-Z]"
-)
-
-# CLASS 0 section anchors  (NOT codable: instructions, dispensing, narratives)
+# Class 0 anchors — fragments here are administrative/dispositional/educational
 _SEC0_DISCHARGE_MEDS = re.compile(
     r"(discharge\s+medications?|medications?\s+on\s+discharge)\s*[:\n]",
     re.IGNORECASE,
@@ -323,10 +352,6 @@ _SEC0_SOCIAL = re.compile(
     r"(social\s+history|family\s+history)\s*[:\n]",
     re.IGNORECASE,
 )
-_SEC0_ALLERGIES = re.compile(
-    r"(allergies?)\s*[:\n]",
-    re.IGNORECASE,
-)
 _SEC0_DISPOSITION = re.compile(
     r"(discharge\s+disposition|discharge\s+condition)\s*[:\n]",
     re.IGNORECASE,
@@ -336,7 +361,8 @@ _SEC0_PHYS_EXAM = re.compile(
     re.IGNORECASE,
 )
 
-# Numbered-list-style medication entry markers — strong class 0 signal
+# Numbered medication lines — strong "this is a med list" signal. Used to drop
+# class-1 anchors that are dominated by med lists rather than diagnoses.
 _NUMBERED_MED_LINE = re.compile(
     r"^\s*\d+\.\s+\w+.{0,40}\b(mg|mcg|tablet|capsule|sig:|po\b|iv\b|disp:)",
     re.IGNORECASE | re.MULTILINE,
@@ -346,12 +372,13 @@ _NUMBERED_MED_LINE = re.compile(
 def _extract_window(text: str, start: int, target_words: int) -> str:
     """Take a fragment starting at `start` containing target_words words."""
     fragment = text[start:]
-    words = fragment.split()
-    return " ".join(words[:target_words])
+    return " ".join(fragment.split()[:target_words])
 
 
 def _classify_imaging_impression(impression_text: str) -> int | None:
-    """Imaging impressions: positive → class 1, negative/stable → class 0."""
+    """Lightweight content classifier for radiology IMPRESSION blocks.
+    Counts positive vs negative finding signals; returns 1, 0, or None for
+    ambiguous. Only confident classifications are kept."""
     pos_signals = 0
     neg_signals = 0
 
@@ -366,7 +393,6 @@ def _classify_imaging_impression(impression_text: str) -> int | None:
                  impression_text, re.IGNORECASE):
         neg_signals += 2
 
-    # Positive: explicit new/worsening finding or named pathology
     if re.search(r"\b(new|worsening|increased|interval increase|developing|"
                  r"progressive|appeared|developed|enlargement|enlarging)\b.{0,40}"
                  r"\b(opacity|effusion|hemorrhage|infarct|edema|mass|lesion|"
@@ -389,14 +415,12 @@ def _classify_imaging_impression(impression_text: str) -> int | None:
         return 1
     if neg_signals >= 2 and pos_signals == 0:
         return 0
-    return None  # ambiguous
+    return None
 
 
 def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
-    """
-    Walk every note, extract section-anchored fragments, label by section type.
-    Returns (class1_list, class0_list).
-    """
+    """Walk every note and emit section-anchored fragments. Returns the two
+    class lists; capped at SECTION_FRAG_PER_CLASS each."""
     target = config.SECTION_FRAG_TARGET_WORDS
     n_max  = config.SECTION_FRAG_PER_CLASS
     minw   = config.SECTION_FRAG_MIN_WORDS
@@ -432,33 +456,22 @@ def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
         if len(text.split()) < 30:
             continue
 
-        # ── CLASS 1 anchors (HIGH-CONFIDENCE) ─────────────────────────────
-        # Discharge Diagnosis, Active Issues, etc. — these are focused
-        # diagnostic listings. Past Medical History — patient has these
-        # conditions. Surgical Procedure — explicit named procedure.
-        # HPI — patient presentation/diagnosis statement.
-        # Brief Hospital Course — RESTORED in round 3-fix. Most BHC fragments
-        # are class 1 in gold (including multi-`#` chunks like "# Bilateral
-        # hearing loss" which is gold-labeled 1). Removing it in round 2
-        # caused a regression.
+        # Class 1 section anchors. Fragments dominated by numbered medication
+        # lists are dropped (they look like dispensing, not diagnosis).
         for pat in (_SEC1_DISCHARGE_DX, _SEC1_PMH, _SEC1_SURGICAL,
                     _SEC1_HPI, _SEC1_BRIEF_HOSPITAL_COURSE):
             for m in pat.finditer(text):
                 frag = _extract_window(text, m.start(), target)
-                # Hard veto: drop fragments dominated by numbered med list
                 if len(_NUMBERED_MED_LINE.findall(frag)) >= 2:
                     continue
                 _add(frag, 1)
                 if len(class1) >= n_max:
                     break
 
-        # # Disease: style hospital course chunks → class 1.
-        # Both single-problem AND multi-problem `#` blocks count as class 1
-        # in gold (e.g. gold example #7 has multiple `#` headers and is
-        # class 1). The round-2 multi-hash demotion was wrong.
+        # # Disease: hospital-course chunks. Skip if they look like a
+        # disposition section (those are class 0).
         for m in _SEC1_HOSPITAL_COURSE_PROBLEM.finditer(text):
             frag = _extract_window(text, m.start(), target)
-            # Skip if it looks like disposition/instructions
             if re.search(r"\b(discharge|disposition|instructions)\b",
                          frag[:60], re.IGNORECASE):
                 continue
@@ -466,7 +479,7 @@ def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
             if len(class1) >= n_max:
                 break
 
-        # ── CLASS 0 anchors ────────────────────────────────────────────────
+        # Class 0 section anchors
         for pat in (_SEC0_DISCHARGE_MEDS, _SEC0_DISCHARGE_INSTR,
                     _SEC0_SOCIAL, _SEC0_DISPOSITION, _SEC0_PHYS_EXAM):
             for m in pat.finditer(text):
@@ -475,7 +488,7 @@ def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
                 if len(class0) >= n_max:
                     break
 
-        # ── Imaging IMPRESSION (radiology only) — class depends on content ──
+        # Imaging IMPRESSION blocks — content-classified
         if cat == "Radiology":
             for m in re.finditer(r"\b(?:IMPRESSION|FINDINGS|CONCLUSION)\s*:\s*",
                                  text):
@@ -485,10 +498,6 @@ def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
                     _add(frag, cls)
                 if len(class1) >= n_max and len(class0) >= n_max:
                     break
-            # ROUND 3-FIX-2: REMOVED radiology body addition. It made the
-            # model slightly more class-1-biased (gold acc went 0.95 → 0.85)
-            # which negated the benefit of prior shift. Cleaner round-2
-            # pipeline + prior shift on top works better.
 
     print(f"[Stage 5c] Section fragments — class1: {len(class1):,}, "
           f"class0: {len(class0):,}")
@@ -505,20 +514,32 @@ def build_section_pseudo(notes_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 5d — TF-IDF nearest-neighbor mining anchored to gold (NEW)
+# Stage 5d: Bio_ClinicalBERT semantic neighbour mining
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# For each of the 20 gold examples, find the K most-similar candidate fragments
-# in MIMIC and propagate the gold label. This produces training data that
-# *actually looks like* the test data — closing the train/test domain gap.
-# ─────────────────────────────────────────────────────────────────────────────
+# Builds a candidate pool of ~80k diverse fragments from MIMIC, embeds them
+# with Bio_ClinicalBERT, then for each gold example finds the K nearest
+# fragments by cosine similarity. Two outputs:
+#
+#   1. Top-K neighbours per gold → labelled with the gold's class (gold-like
+#      training examples that broaden distribution coverage).
+#
+#   2. Hard negatives: for each class-1 gold example, find candidates with
+#      high semantic similarity that ALSO match class-0 narrative cues
+#      (planning/disposition/instruction language, micro lab dumps, imaging
+#      comparison). Label these class 0. They teach the model that
+#      "looks codable but isn't" is a thing.
+#
+# The hard-negative cue regex is gated by a positive-override regex that
+# protects fragments containing strong class-1 section headers (e.g. a
+# "Discharge Diagnosis:" header makes a fragment class 1 even if it also
+# contains "Sig: One"). This is critical — without it some real class-1
+# patterns get mislabelled as hard negatives.
 
 def _candidate_fragments_for_neighbor_mining(notes_df: pd.DataFrame,
                                              max_per_note: int = 3) -> list[str]:
-    """
-    Generate fragment candidates by sliding ~100-word windows over every note
-    starting at section anchors and at every double-newline.
-    """
+    """Generate fragment candidates by extracting windows starting at every
+    section header and every paragraph break. Returns a deduplicated list."""
     target = config.SECTION_FRAG_TARGET_WORDS
     minw   = config.SECTION_FRAG_MIN_WORDS
     maxw   = config.SECTION_FRAG_MAX_WORDS
@@ -546,7 +567,6 @@ def _candidate_fragments_for_neighbor_mining(notes_df: pd.DataFrame,
         if len(text.split()) < 30:
             continue
         anchors = [m.start() for m in section_re.finditer(text)]
-        # Add a few generic anchors at paragraph breaks
         anchors += [m.start() for m in re.finditer(r"\n\s*\n", text)]
         anchors = sorted(set(anchors))[: max_per_note * 3]
 
@@ -564,13 +584,9 @@ def _candidate_fragments_for_neighbor_mining(notes_df: pd.DataFrame,
 
 
 def _bert_encode_batch(texts: list[str], tokenizer, encoder,
-                        device, max_len: int = 256, bs: int = 32) -> "np.ndarray":
-    """
-    Mean-pool Bio_ClinicalBERT embeddings for a list of texts.
-    Returns shape (n, hidden_size). Used for semantic similarity in Stage 5d.
-    """
+                        device, max_len: int = 256, bs: int = 32) -> np.ndarray:
+    """Mean-pool Bio_ClinicalBERT embeddings, L2-normalized for cosine sim."""
     import torch
-    import numpy as _np
     encoder.eval()
     out = []
     with torch.no_grad():
@@ -581,21 +597,17 @@ def _bert_encode_batch(texts: list[str], tokenizer, encoder,
             ids  = enc["input_ids"].to(device)
             mask = enc["attention_mask"].to(device)
             outputs = encoder(input_ids=ids, attention_mask=mask)
-            tok = outputs.last_hidden_state         # (B, L, H)
+            tok = outputs.last_hidden_state
             m = mask.unsqueeze(-1).float()
-            pooled = (tok * m).sum(1) / m.sum(1).clamp(min=1e-9)  # (B, H)
-            # L2-normalize for cosine sim
+            pooled = (tok * m).sum(1) / m.sum(1).clamp(min=1e-9)
             pooled = pooled / pooled.norm(dim=1, keepdim=True).clamp(min=1e-9)
             out.append(pooled.cpu().numpy())
-    return _np.concatenate(out, axis=0) if out else _np.zeros((0, 768))
+    return np.concatenate(out, axis=0) if out else np.zeros((0, 768))
 
 
-# Class-0 patterns used in hard-negative filtering — these texts LOOK class-1
-# (by lexical similarity to gold class 1) but contain unmistakable class-0
-# narrative cues like "will continue", "at the time of discharge", "should be
-# transitioned". When such a candidate is a top match for a class-1 gold
-# example, it's a HARD NEGATIVE: similar to class 1 but actually class 0.
-# We label them class 0 explicitly to teach the model the contrast.
+# Class-0 narrative cues — used to identify hard negatives. These are
+# patterns common in fragments that look codable lexically but are
+# actually administrative / dispositional / instructional.
 _HARD_NEGATIVE_CUES = re.compile(
     r"\b(at the time of discharge|will continue this for|"
     r"should be transitioned to|please (?:take|continue|stop|avoid|call|return)|"
@@ -608,11 +620,10 @@ _HARD_NEGATIVE_CUES = re.compile(
     re.IGNORECASE,
 )
 
-# CRITICAL: positive overrides. Two gold class-1 examples matched the
-# hard-negative cue regex (because they include "Sig: One" and "Disp:*16"
-# *followed by* a Discharge Diagnosis listing). If a candidate matches the
-# hard-negative cues AND has any of these positive overrides, it's NOT a
-# hard negative — leave it for the regular neighbor mining pass.
+# Positive override: even if the cues fire, the fragment is NOT a hard
+# negative when it also contains a strong class-1 section header. Two of the
+# 20 gold class-1 examples contain "Sig: One" and "Disp:*16" but follow with
+# a Discharge Diagnosis listing — these would otherwise be mislabelled.
 _HARD_NEG_POSITIVE_OVERRIDE = re.compile(
     r"\b(discharge\s+diagnosis|primary\s+diagnosis|principal\s+diagnosis|"
     r"admitting\s+diagnosis|active\s+issues?|past\s+medical\s+history|"
@@ -623,7 +634,6 @@ _HARD_NEG_POSITIVE_OVERRIDE = re.compile(
 
 
 def _is_hard_negative(text: str) -> bool:
-    """True iff text matches HARD_NEGATIVE_CUES and NOT POSITIVE_OVERRIDE."""
     if _HARD_NEG_POSITIVE_OVERRIDE.search(text):
         return False
     return bool(_HARD_NEGATIVE_CUES.search(text))
@@ -631,28 +641,16 @@ def _is_hard_negative(text: str) -> bool:
 
 def build_neighbor_pseudo(notes_df: pd.DataFrame,
                           gold_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mine class-1 neighbors AND hard negatives for each gold example using
-    Bio_ClinicalBERT semantic embeddings.
-
-    For each gold class-1 example:
-      - top-K most-similar candidates → label class 1
-      - candidates above a fairly-similar threshold (>0.50 SBERT-style) that
-        ALSO match _HARD_NEGATIVE_CUES → label class 0 (hard negatives)
-
-    For each gold class-0 example:
-      - top-K most-similar candidates → label class 0
-    """
+    """Mine semantic neighbours and hard negatives for each gold example."""
     if config.NEIGHBOR_PER_GOLD <= 0:
         return pd.DataFrame(columns=["text", "label"])
 
     import torch
+    from model import MODEL_NAME as _BERT_MODEL_NAME
     from model import load_tokenizer
     from transformers import AutoModel
 
     print("[Stage 5d] Generating candidate pool for neighbor mining...")
-    # ROUND-FIX: throttle candidate count to stay within runtime budget.
-    # 80k candidates is enough diversity for 20 gold seeds with K~30 each.
     per_note = int(getattr(config, "NEIGHBOR_CANDIDATES_PER_NOTE", 4))
     cap      = int(getattr(config, "NEIGHBOR_CANDIDATE_POOL", 80_000))
 
@@ -665,41 +663,31 @@ def build_neighbor_pseudo(notes_df: pd.DataFrame,
     else:
         candidates = candidates_full
     print(f"[Stage 5d]   {len(candidates_full):,} → {len(candidates):,} candidate fragments")
-
     if len(candidates) == 0:
         return pd.DataFrame(columns=["text", "label"])
 
-    # ── Embedding ─────────────────────────────────────────────────────────
+    # Embed gold + candidates with Bio_ClinicalBERT
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Stage 5d] Loading Bio_ClinicalBERT for embedding (device={device})...")
-    # IMPORTANT: use the same MODEL_NAME from model.py which respects the
-    # MODEL_PATH env var (Grace cluster has it pointed at a local path).
-    # Using config.MODEL_NAME directly fails with OSError because it tries
-    # to download from huggingface.co.
-    from model import MODEL_NAME as _BERT_MODEL_NAME
     tokenizer = load_tokenizer()
-    encoder   = AutoModel.from_pretrained(
-        _BERT_MODEL_NAME,
-        local_files_only=True,
-    ).to(device)
+    encoder   = AutoModel.from_pretrained(_BERT_MODEL_NAME, local_files_only=True).to(device)
 
     gold_texts = gold_df["text"].tolist()
     gold_labels = gold_df["label"].astype(int).tolist()
 
     print("[Stage 5d] Embedding gold (n=20)...")
     G = _bert_encode_batch(gold_texts, tokenizer, encoder, device)
-
     print(f"[Stage 5d] Embedding {len(candidates):,} candidates...")
-    # Larger batch for candidates since we don't backprop
     C = _bert_encode_batch(candidates, tokenizer, encoder, device, bs=64)
 
-    # Free the encoder before training kicks in
+    # Free encoder memory before training kicks in (it'll load its own copy)
     del encoder
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Cosine similarity (G and C are L2-normalized → dot product = cosine)
     print("[Stage 5d] Computing similarities...")
-    sims = G @ C.T          # (20, n_candidates)
+    sims = G @ C.T   # (20, n_candidates)
 
     K = int(config.NEIGHBOR_PER_GOLD)
     min_sim = float(config.NEIGHBOR_MIN_SIM)
@@ -708,7 +696,7 @@ def build_neighbor_pseudo(notes_df: pd.DataFrame,
     used_candidate_idx = set()
     chosen = []   # (text, label, sim, gold_idx, source)
 
-    # Pass 1: for each gold example, pick top-K disjoint same-class neighbors
+    # Pass 1: top-K nearest neighbours per gold, propagate gold's label
     for gi in range(len(gold_texts)):
         order = np.argsort(-sims[gi])
         picked = 0
@@ -725,9 +713,8 @@ def build_neighbor_pseudo(notes_df: pd.DataFrame,
             chosen.append((candidates[ci], gold_labels[gi], float(s), gi, "neighbor"))
             picked += 1
 
-    # Pass 2: hard negatives. For each class-1 gold example, find candidates
-    # with high similarity (≥ hard_neg_min_sim) that ALSO match the hard-
-    # negative cue regex. Label them class 0.
+    # Pass 2: hard negatives. For each class-1 gold, find still-similar
+    # candidates that contain class-0 cues. Label them class 0.
     n_hard_neg = 0
     hard_neg_per_gold = int(getattr(config, "HARD_NEG_PER_GOLD", 10))
     for gi, gl in enumerate(gold_labels):
@@ -765,24 +752,28 @@ def build_neighbor_pseudo(notes_df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
+# Pipeline driver
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline() -> pd.DataFrame:
+    """Run all stages, write pseudo_labeled.csv, return the combined DataFrame.
+
+    Output schema: text, label (int 0/1). Gold examples are appended at the
+    end so train.py can find them by exact text match."""
     random.seed(config.RANDOM_SEED)
     np.random.seed(config.RANDOM_SEED)
 
     # Stage 1
     icd_terms = build_icd_term_set()
 
-    # Stage 2 — sentence pseudo-labels use the sampled subset for speed
+    # Stage 2 — sentence pseudo uses a sampled subset for speed
     notes_sample = load_noteevents(max_n=config.MAX_NOTES_TO_SAMPLE)
 
     # Stage 5a
     sentence_df = build_sentence_pseudo(notes_sample, icd_terms)
 
-    # Stage 5c & 5d use the FULL notes set (no sample cap) so we have enough
-    # supply of every section type and rich neighbor mining material.
+    # Stages 5c & 5d use the full notes set for richer section coverage and
+    # better neighbour mining.
     print("[Pipeline] Loading full notes for section + neighbor mining...")
     notes_full = load_noteevents(
         categories=["Discharge summary", "Radiology", "Physician"],
@@ -792,7 +783,7 @@ def run_pipeline() -> pd.DataFrame:
     # Stage 5c
     section_df = build_section_pseudo(notes_full)
 
-    # Stage 5d — load gold for neighbor mining
+    # Load gold for stage 5d (and to append at the end)
     gold_df = pd.read_csv(config.TRAIN_CSV, dtype=str)
     gold_df.columns = [c.strip().lower() for c in gold_df.columns]
     tc = next(c for c in gold_df.columns if "text" in c)
@@ -800,14 +791,14 @@ def run_pipeline() -> pd.DataFrame:
     gold_df = gold_df[[tc, lc]].rename(columns={tc: "text", lc: "label"})
     gold_df["label"] = gold_df["label"].astype(int)
 
+    # Stage 5d
     neighbor_df = build_neighbor_pseudo(notes_full, gold_df)
 
-    # Combine all pseudo sources
-    pseudo_df = pd.concat([sentence_df, section_df, neighbor_df],
-                          ignore_index=True)
+    # Combine and clean
+    pseudo_df = pd.concat([sentence_df, section_df, neighbor_df], ignore_index=True)
     pseudo_df["label"] = pseudo_df["label"].astype(int)
 
-    # Drop any pseudo row whose text exactly matches gold (so evaluation is clean)
+    # Drop pseudo rows that exact-match gold so validation stays clean
     gold_text_set = set(gold_df["text"].tolist())
     before = len(pseudo_df)
     pseudo_df = pseudo_df[~pseudo_df["text"].isin(gold_text_set)].reset_index(drop=True)
@@ -815,11 +806,13 @@ def run_pipeline() -> pd.DataFrame:
           f"matched gold text")
 
     pseudo_df = pseudo_df.drop_duplicates(subset=["text"]).reset_index(drop=True)
-    pseudo_df = pseudo_df.sample(frac=1, random_state=config.RANDOM_SEED) \
-                          .reset_index(drop=True)
+    pseudo_df = pseudo_df.sample(frac=1, random_state=config.RANDOM_SEED).reset_index(drop=True)
 
-    # Append gold to the end so train.py can locate them
     combined = pd.concat([pseudo_df, gold_df], ignore_index=True)
+    
+    # Enforce MAX_WORDS limit on all text entries
+    combined["text"] = combined["text"].apply(_truncate_to_max_words)
+    
     combined.to_csv(config.PSEUDO_LABEL_CSV, index=False)
 
     print(f"\n[Pipeline] FINAL composition:")

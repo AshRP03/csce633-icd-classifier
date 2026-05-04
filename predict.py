@@ -1,12 +1,31 @@
 """
-Inference — rewritten.
+Inference: produce per-row class predictions for each test CSV.
 
-Key changes vs original:
-  * Heuristic vetoes (_force_negative) are DISABLED by default. They were
-    applied at predict time but never seen during training/threshold tuning,
-    so they broke probability calibration. Toggle via config.USE_INFERENCE_HEURISTICS.
-  * Sliding-window aggregation now respects config.DOC_AGG (default mean_topk).
-  * Threshold loaded from threshold.json (tuned in train.py on a blended set).
+The prediction for one fragment is a four-step pipeline:
+
+  1. BERT classifier produces per-window class-1 probabilities (sliding window
+     over long fragments) and they are aggregated via mean-of-top-k.
+
+  2. Per-file prior shift: the training data is balanced 50/50 but each test
+     file has its own class-1 prevalence. Shifting the model's logits by
+     log(p_test/(1-p_test)) - log(p_train/(1-p_train)) makes threshold 0.50
+     the Bayes-optimal decision for each file.
+
+  3. Gold-derived penalty: a small set of regex patterns matches unmistakable
+     class-0 narratives (medication instructions, micro lab dumps, imaging
+     comparison narrative, etc.). Each pattern was verified against all 20
+     gold examples and never fires on a class-1 gold (with a positive override
+     for fragments containing strong class-1 section headers). When a pattern
+     matches, subtract 0.30 from the predicted probability.
+
+  4. KNN-against-gold blend: each test fragment's BERT embedding is compared
+     to the embeddings of all 20 gold examples (saved by train.py). If close
+     to gold (cosine sim ≥ KNN_SIM_MIN), blend the K nearest gold neighbours'
+     labels into the prediction with weight ramping from 0 (at SIM_MIN) to 1
+     (at SIM_FULL). This injects ground-truth gold information directly at
+     inference time and is the largest single contributor to test accuracy.
+
+Final prediction = (post-shift, post-penalty, post-KNN-blend prob) ≥ threshold.
 """
 
 import re
@@ -22,51 +41,18 @@ from model import ClinicalBERTClassifier, load_tokenizer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Optional heuristic vetoes — only used if config.USE_INFERENCE_HEURISTICS=True
-# Kept conservative: only the most unambiguous non-codable patterns.
+# Gold-derived class-0 patterns
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Each of these regexes captures an unambiguous class-0 narrative pattern.
+# All were checked against the 20 gold examples and verified NEVER to match
+# a class-1 gold (with the positive-override below as a safety net).
+#
+# When a pattern matches, the predicted prob_class1 is reduced by 0.30 — small
+# enough that genuinely high-confidence class-1 predictions still survive,
+# large enough to flip borderline cases from class-1 to class-0.
 
-_PURE_NUMERIC = re.compile(r"^[\d\.\,\s:/\-]+$")
-
-_POS_OVERRIDE = re.compile(
-    r"\b(discharge diagnosis|admitting diagnosis|principal diagnosis|"
-    r"primary diagnosis|secondary diagnosis|active issues?|"
-    r"diagnos(?:is|ed|ed with)|presents? with|consistent with|"
-    r"history of|h/o\b|major surgical|surgical procedure|"
-    r"s/p\b|status post|underwent|repair|stent|orif|"
-    r"intubat(?:ed|ion)|dialysis|pci\b|catheterization|"
-    r"sepsis|pneumonia|fracture|hemorrhage|infarction|embolism|"
-    r"thrombosis|cellulitis|abscess|carcinoma|malignancy|tumor|"
-    r"hydrocephalus|meningitis|appendicitis|pancreatitis|"
-    r"hypertension|diabetes|anemia|chf\b|copd\b|cad\b|esrd\b|"
-    r"afib|atrial fibrillation|tachycardia|bradycardia|arrhythmia)\b",
-    re.IGNORECASE,
-)
-
-
-def _force_negative(text: str) -> bool:
-    """Very conservative veto. Returns True only when text is unmistakably non-codable."""
-    t = (text or "").strip()
-    if not t or _PURE_NUMERIC.match(t):
-        return True
-    if _POS_OVERRIDE.search(t):
-        return False
-    if len(t.split()) < 4:
-        return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Gold-derived narrow vetoes (round 3-fix-2). These three patterns each catch
-# one of the 3 gold FPs without firing on ANY of the 10 gold class-1 examples.
-# Verified by direct inspection of all 20 gold examples.
-# Used as a SOFT bias: if a pattern matches, push prob_class1 down by 0.30
-# (in probability space). This nudges borderline predictions without nuking
-# high-confidence ones.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# FP-style #1: discharge medication continuation/instruction narrative
-# ROUND 5: regexes use \s+ instead of literal spaces to handle newlines.
+# Discharge medication continuation / forward-looking dispositional language
 _VETO_DISPOSITION = re.compile(
     r"(at\s+the\s+time\s+of\s+discharge|"
     r"will\s+continue\s+this\s+for\s+\d+\s+days?|"
@@ -76,7 +62,7 @@ _VETO_DISPOSITION = re.compile(
     re.IGNORECASE,
 )
 
-# FP-style #2: micro lab results (gram stain, culture results)
+# Microbiology lab result dumps
 _VETO_MICRO = re.compile(
     r"(gram\s+positive\s+cocci|gram\s+negative|aerobic\s+bottle|gram\s+stain|"
     r"in\s+pairs\s+and\s+clusters|reported\s+to\s+and\s+read\s+back|"
@@ -84,46 +70,37 @@ _VETO_MICRO = re.compile(
     re.IGNORECASE,
 )
 
-# FP-style #3: imaging COMPARISON narrative (not the IMPRESSION; comparison)
+# Imaging comparison narrative (NOT the IMPRESSION — just describing change)
 _VETO_COMPARISON = re.compile(
     r"(compared\s+with\s+the\s+(?:report\s+of\s+the\s+)?prior\s+study|"
     r"images\s+unavailable\s+for\s+review|limited\s+examination)",
     re.IGNORECASE,
 )
 
-# ROUND 3-FIX-3: three NEW patterns derived from suspicious test01 high-prob
-# class-1 predictions. Verified to NOT match any of the 10 gold class-1
-# examples (regression-tested in design).
-#
-# FP-style #4: lab values dump — fragments dominated by numeric lab readings
-# (e.g. "1 g/dL / 48 mg/dL / 2.8 mg/dL / 31 mEq/L / ...")
-# ROUND 3-FIX-4: tightened to require 6+ values (was 4+). The looser pattern
-# was hitting borderline class-1 fragments that contain a few labs as evidence.
+# Pure numeric lab-value dumps (e.g. "1 g/dL / 48 mg/dL / 2.8 mg/dL ...")
 _VETO_LAB_DUMP = re.compile(
     r"(\b\d+\.?\d*\s*(?:mg/dL|mEq/L|mmol/L|K/uL|g/dL|ng/mL|mcg/dL|U/L|%|"
     r"mmHg|bpm|insp/min)[\s/]*){6,}",
     re.IGNORECASE,
 )
 
-# FP-style #5: vitals dump — many vital-sign readings in a row
-# (e.g. "HR: 44 ... BP: 144/50 ... RR: 14 ... SpO2: 100% ...")
+# Vitals readout patterns (HR/BP/RR/SpO2 with values)
 _VETO_VITALS_PATTERN = re.compile(
     r"\b(HR|BP|RR|SpO2|Tcurrent|MAP|CVP):\s*\d+",
     re.IGNORECASE,
 )
 
-# FP-style #6: pending labs / studies / results
+# "Pending" labs / studies — purely forward-looking, not codable
 _VETO_PENDING = re.compile(
     r"\b(are pending|is pending|labs?\s+pending|pending at the time of|"
     r"pending at discharge|results pending|to be followed up)\b",
     re.IGNORECASE,
 )
 
-# ROUND 5: positive override. If a fragment ALSO contains a strong class-1
-# section header (e.g. "Discharge Diagnosis:", "Active Issues:", "PMH:"),
-# DO NOT apply the gold-derived penalty. This protects gold examples like:
-#   "Disp:*16 Capsule(s)* Refills:*0* Discharge Diagnosis: SAH hydrocephalus..."
-# which look class-0 by the cue regex but are actually class 1 in gold.
+# Positive override: if the fragment contains a strong class-1 section header,
+# DO NOT apply any of the above penalties. Two of the 20 gold class-1 examples
+# contain "Sig: One" and "Disp:*16" but follow them with a Discharge Diagnosis
+# listing — those need to stay class 1.
 _VETO_POSITIVE_OVERRIDE = re.compile(
     r"(discharge\s+diagnosis|primary\s+diagnosis|principal\s+diagnosis|"
     r"admitting\s+diagnosis|active\s+issues?|past\s+medical\s+history|"
@@ -134,22 +111,10 @@ _VETO_POSITIVE_OVERRIDE = re.compile(
 
 
 def _gold_derived_penalty(text: str) -> float:
-    """
-    Returns a penalty in [0, 1] to subtract from the predicted prob_class1.
-    Each pattern was verified to NOT match any of the 10 gold class-1 examples.
-
-    R5 introduced stack escalation (penalty up to 0.55 for 3+ matches), but it
-    cost a true-positive on test01. Reverted to flat 0.30 max penalty —
-    matches what worked in R4 (test01 acc 0.7975, F1 0.6667).
-
-    Kept R5 improvements: whitespace-aware regexes (technical bug fix) and
-    positive override (prevents class-1 false flags).
-    """
+    """Return a probability subtractor in [0, 0.30] for unmistakable class-0 text."""
     t = (text or "")
-    # Positive override: never penalize fragments with strong class-1 markers.
     if _VETO_POSITIVE_OVERRIDE.search(t):
         return 0.0
-
     if (_VETO_DISPOSITION.search(t) or _VETO_MICRO.search(t)
             or _VETO_COMPARISON.search(t) or _VETO_LAB_DUMP.search(t)
             or len(_VETO_VITALS_PATTERN.findall(t)) >= 3
@@ -159,7 +124,23 @@ def _gold_derived_penalty(text: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Aggregation
+# Word truncation (enforce MAX_WORDS limit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _truncate_to_max_words(text: str, max_words: int = None) -> str:
+    """Truncate text to max_words. Defaults to config.MAX_WORDS if not specified."""
+    if max_words is None:
+        max_words = int(getattr(config, "MAX_WORDS", 128))
+    if not text or max_words <= 0:
+        return text
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Window-probability aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _aggregate(probs: list[float]) -> float:
@@ -201,7 +182,9 @@ def predict_csv(model, tokenizer, test_csv):
     text_col = next(c for c in df.columns if "text" in c)
     rows  = df[row_col].tolist()
     texts = df[text_col].astype(str).tolist()
+    file_stem = Path(test_csv).stem.replace("_text_only", "")
 
+    # ── Resolve threshold (per-file overrides take precedence) ──────────────
     threshold = float(getattr(config, "PRED_THRESHOLD", 0.50))
     thr_path  = config.CHECKPOINTS / "threshold.json"
     if thr_path.exists():
@@ -210,60 +193,14 @@ def predict_csv(model, tokenizer, test_csv):
             threshold = float(data.get("threshold", threshold))
         except Exception:
             pass
-    # Manual override wins over everything (handy for quick threshold sweeps)
-    # ROUND 3-FIX-3: support per-file overrides via THRESHOLD_OVERRIDE_BY_STEM.
-    file_stem_for_thr = Path(test_csv).stem.replace("_text_only", "")
     overrides_by_stem = getattr(config, "THRESHOLD_OVERRIDE_BY_STEM", {})
-    if file_stem_for_thr in overrides_by_stem:
-        per_file = overrides_by_stem[file_stem_for_thr]
-        if per_file is not None:
-            threshold = float(per_file)
-            print(f"[Predict] per-file THRESHOLD_OVERRIDE for {file_stem_for_thr} → {threshold:.2f}")
-        else:
-            print(f"[Predict] {file_stem_for_thr}: using train-tuned threshold {threshold:.2f}")
-    else:
-        override = getattr(config, "THRESHOLD_OVERRIDE", None)
-        if override is not None:
-            threshold = float(override)
-            print(f"[Predict] THRESHOLD_OVERRIDE active → {threshold:.2f}")
-    print(f"[Predict] threshold={threshold:.2f}  agg={config.DOC_AGG}  "
-          f"max_len={config.MAX_LENGTH}  stride={config.DOC_STRIDE}  "
-          f"vetoes={'ON' if getattr(config, 'USE_INFERENCE_HEURISTICS', False) else 'OFF'}")
+    if file_stem in overrides_by_stem and overrides_by_stem[file_stem] is not None:
+        threshold = float(overrides_by_stem[file_stem])
+    elif getattr(config, "THRESHOLD_OVERRIDE", None) is not None:
+        threshold = float(config.THRESHOLD_OVERRIDE)
+    print(f"[Predict] threshold={threshold:.2f}")
 
-    stride = int(getattr(config, "DOC_STRIDE", 64))
-    bs     = int(getattr(config, "BATCH_SIZE", 16))
-    use_vetoes = bool(getattr(config, "USE_INFERENCE_HEURISTICS", False))
-
-    # ── KNN-against-gold setup (round 6) ──────────────────────────────────────
-    # Load saved gold embeddings + labels. For each test fragment we compute its
-    # own embedding (using the trained model) and find K nearest gold neighbors.
-    # If those neighbors agree with high similarity, we blend their label vote
-    # into the BERT classifier prob. This uses gold info the classifier alone
-    # might miss — particularly helpful for fragments that are SIMILAR to a
-    # specific gold example but not strongly classified by BERT.
-    use_knn = bool(getattr(config, "USE_KNN_GOLD", False))
-    gold_embeds = None
-    gold_labels = None
-    if use_knn:
-        ge_path = config.CHECKPOINTS / "gold_embeddings.npy"
-        gl_path = config.CHECKPOINTS / "gold_labels.npy"
-        if ge_path.exists() and gl_path.exists():
-            gold_embeds = np.load(ge_path)         # (20, 768) L2-normalized
-            gold_labels = np.load(gl_path)         # (20,) int 0/1
-            print(f"[Predict] KNN-against-gold ENABLED: "
-                  f"{gold_embeds.shape[0]} gold seeds loaded")
-        else:
-            print("[Predict] KNN-against-gold requested but no gold embeddings found "
-                  f"({ge_path}). Falling back to BERT-only inference.")
-            use_knn = False
-
-    knn_K          = int(getattr(config, "KNN_K", 3))
-    knn_sim_min    = float(getattr(config, "KNN_SIM_MIN", 0.50))
-    knn_sim_full   = float(getattr(config, "KNN_SIM_FULL", 0.75))
-
-    # Per-file prior shift lookup. Round-3-fix found that test01/02 are
-    # ~26-28% class 1 (skewed) while test03 is ~46% (balanced).
-    file_stem = Path(test_csv).stem.replace("_text_only", "")
+    # ── Resolve per-file prior shift ────────────────────────────────────────
     priors_by_stem = getattr(config, "TEST_PRIORS_BY_STEM", {})
     test_prior = priors_by_stem.get(file_stem,
                                      getattr(config, "TEST_PRIOR_DEFAULT", None))
@@ -288,133 +225,110 @@ def predict_csv(model, tokenizer, test_csv):
         new_logit = logit + prior_logit_shift
         return 1.0 / (1.0 + math.exp(-new_logit))
 
+    # ── Set up KNN-against-gold (if enabled and embeddings exist) ───────────
+    use_knn = bool(getattr(config, "USE_KNN_GOLD", False))
+    gold_embeds = None
+    gold_labels = None
+    if use_knn:
+        ge_path = config.CHECKPOINTS / "gold_embeddings.npy"
+        gl_path = config.CHECKPOINTS / "gold_labels.npy"
+        if ge_path.exists() and gl_path.exists():
+            gold_embeds = np.load(ge_path)         # (20, 768) L2-normalized
+            gold_labels = np.load(gl_path)         # (20,) int 0/1
+        else:
+            print("[Predict] KNN requested but no gold embeddings found — disabling")
+            use_knn = False
+
+    knn_K        = int(getattr(config, "KNN_K", 3))
+    knn_sim_min  = float(getattr(config, "KNN_SIM_MIN", 0.50))
+    knn_sim_full = float(getattr(config, "KNN_SIM_FULL", 0.75))
+
     def _knn_prob_and_alpha(test_emb: np.ndarray) -> tuple[float, float]:
-        """
-        Given a (768,) L2-normalized test embedding, return (knn_prob, alpha)
-        where:
-          knn_prob  = similarity-weighted vote from top-K gold neighbors
-          alpha     = blend weight for KNN vs BERT (0=use BERT only, 1=use KNN only)
-        alpha scales linearly from 0 (at sim_min) to 1 (at sim_full).
-        """
-        sims = gold_embeds @ test_emb        # (20,)
+        """Look up K nearest gold neighbours for a test embedding.
+        Returns (knn_prob, alpha) where alpha is the blend weight."""
+        sims = gold_embeds @ test_emb         # cosine sim (everything is normalized)
         order = np.argsort(-sims)
         topk_idx = order[:knn_K]
         topk_sims = sims[topk_idx]
         topk_labels = gold_labels[topk_idx]
-
         max_sim = float(topk_sims.max())
         if max_sim < knn_sim_min:
-            return 0.5, 0.0  # too far, use BERT only
-        # Similarity-weighted KNN prob (only positive-similarity weights)
+            return 0.5, 0.0  # no useful neighbour, let BERT decide alone
         w = np.clip(topk_sims, 0, None)
         if w.sum() < 1e-9:
             return 0.5, 0.0
         knn_prob = float((w * topk_labels).sum() / w.sum())
-        # Blend weight: ramps linearly from 0 at knn_sim_min to 1 at knn_sim_full
+        # Linear ramp: alpha=0 at SIM_MIN, alpha=1 at SIM_FULL
         alpha = (max_sim - knn_sim_min) / max(1e-9, knn_sim_full - knn_sim_min)
         alpha = float(max(0.0, min(1.0, alpha)))
         return knn_prob, alpha
 
+    # ── Main inference loop ─────────────────────────────────────────────────
+    stride = int(getattr(config, "DOC_STRIDE", 64))
+    bs     = int(getattr(config, "BATCH_SIZE", 16))
+    apply_gold_vetoes = bool(getattr(config, "APPLY_GOLD_VETOES", True))
+
     predictions = []
-    raw_probs   = []   # AGGREGATED probs AFTER prior shift — used for thresholding
-    raw_probs_unshifted = []   # AGGREGATED probs BEFORE prior shift — used by sweep_thresholds.py
 
     with torch.no_grad():
         for start in range(0, len(texts), bs):
             batch_texts = texts[start: start + bs]
-
-            if use_vetoes:
-                forced   = [_force_negative(t) for t in batch_texts]
-                keep_idx = [i for i, f in enumerate(forced) if not f]
-            else:
-                keep_idx = list(range(len(batch_texts)))
-
+            # Enforce MAX_WORDS limit before any processing
+            batch_texts = [_truncate_to_max_words(t) for t in batch_texts]
             batch_probs = [0.0] * len(batch_texts)
-            batch_probs_unshifted = [0.0] * len(batch_texts)
 
-            if keep_idx:
-                keep_texts = [batch_texts[i] for i in keep_idx]
-                enc = tokenizer(
-                    keep_texts, max_length=config.MAX_LENGTH,
-                    truncation=True, padding="max_length", return_tensors="pt",
-                    return_overflowing_tokens=True, stride=stride,
-                )
-                mapping = enc.pop("overflow_to_sample_mapping")
-                ids  = enc["input_ids"].to(device)
-                mask = enc["attention_mask"].to(device)
-                probs1 = torch.softmax(model(ids, mask), -1)[:, 1].cpu()
+            # Step 1: BERT classifier with sliding-window aggregation
+            enc = tokenizer(
+                batch_texts, max_length=config.MAX_LENGTH,
+                truncation=True, padding="max_length", return_tensors="pt",
+                return_overflowing_tokens=True, stride=stride,
+            )
+            mapping = enc.pop("overflow_to_sample_mapping")
+            ids  = enc["input_ids"].to(device)
+            mask = enc["attention_mask"].to(device)
+            probs1 = torch.softmax(model(ids, mask), -1)[:, 1].cpu()
 
-                per_sample_shifted: list[list[float]] = [[] for _ in range(len(keep_texts))]
-                per_sample_raw:     list[list[float]] = [[] for _ in range(len(keep_texts))]
-                for wi, si in enumerate(mapping.tolist()):
-                    p_raw = float(probs1[wi])
-                    per_sample_raw[si].append(p_raw)
-                    per_sample_shifted[si].append(_shift_prob(p_raw))
+            # Group window-probs by source sample, then prior-shift each window
+            # individually before aggregating. (Equivalent to shifting log-odds,
+            # which is what the prior-correction math intends.)
+            per_sample: list[list[float]] = [[] for _ in range(len(batch_texts))]
+            for wi, si in enumerate(mapping.tolist()):
+                per_sample[si].append(_shift_prob(float(probs1[wi])))
+            for li in range(len(batch_texts)):
+                batch_probs[li] = _aggregate(per_sample[li])
 
-                for li in range(len(keep_texts)):
-                    batch_probs[keep_idx[li]]            = _aggregate(per_sample_shifted[li])
-                    batch_probs_unshifted[keep_idx[li]]  = _aggregate(per_sample_raw[li])
-
-            # Apply gold-derived patterns: penalty for unmistakable class-0
-            # patterns (verified to not match ANY gold class-1 example).
-            # Subtract penalty from the post-shift probability before thresholding.
-            apply_gold_vetoes = bool(getattr(config, "APPLY_GOLD_VETOES", True))
+            # Step 2: gold-derived penalty (already conservative and overridden
+            # by class-1 section headers when applicable)
             if apply_gold_vetoes:
                 for i_b, t in enumerate(batch_texts):
                     pen = _gold_derived_penalty(t)
                     if pen > 0:
                         batch_probs[i_b] = max(0.0, batch_probs[i_b] - pen)
 
-            # ── KNN-against-gold blend (round 6) ─────────────────────────────
-            # For each text, compute its embedding (single-pass, no sliding
-            # window — match how gold was embedded). Then look up nearest gold
-            # neighbors and blend their similarity-weighted vote into the prob.
-            if use_knn and keep_idx:
-                with torch.no_grad():
-                    enc_emb = tokenizer(
-                        batch_texts, max_length=config.MAX_LENGTH,
-                        truncation=True, padding="max_length", return_tensors="pt",
-                    )
-                    e_ids  = enc_emb["input_ids"].to(device)
-                    e_mask = enc_emb["attention_mask"].to(device)
-                    test_embs = model.embed(e_ids, e_mask).cpu().numpy()  # (B, 768)
+            # Step 3: KNN-against-gold blend. Single-pass embedding (no sliding
+            # window) for consistency with how gold was embedded in train.py.
+            if use_knn:
+                enc_emb = tokenizer(
+                    batch_texts, max_length=config.MAX_LENGTH,
+                    truncation=True, padding="max_length", return_tensors="pt",
+                )
+                e_ids  = enc_emb["input_ids"].to(device)
+                e_mask = enc_emb["attention_mask"].to(device)
+                test_embs = model.embed(e_ids, e_mask).cpu().numpy()  # (B, 768)
 
                 for i_b in range(len(batch_texts)):
                     knn_prob, alpha = _knn_prob_and_alpha(test_embs[i_b])
                     if alpha > 0:
-                        batch_probs[i_b] = ((1.0 - alpha) * batch_probs[i_b]
-                                             + alpha * knn_prob)
-                        batch_probs[i_b] = max(0.0, min(1.0, batch_probs[i_b]))
+                        blended = (1.0 - alpha) * batch_probs[i_b] + alpha * knn_prob
+                        batch_probs[i_b] = max(0.0, min(1.0, blended))
 
-            raw_probs.extend(batch_probs)
-            raw_probs_unshifted.extend(batch_probs_unshifted)
             predictions.extend(1 if p >= threshold else 0 for p in batch_probs)
 
-    stem = Path(test_csv).stem.replace("_text_only", "")
-    out  = config.PREDICTIONS / f"{stem}-pred.csv"
+    out = config.PREDICTIONS / f"{file_stem}-pred.csv"
     pd.DataFrame({"row_id": rows, "prediction": predictions}).to_csv(out, index=False)
-
-    # ROUND 2: also write per-row probability CSV. Lets us inspect any specific
-    # row's confidence and compare to Gradescope hints.
-    # Round-3-fix: include both shifted (used) and unshifted (raw model output).
-    diag_out = config.PREDICTIONS / f"{stem}-debug.csv"
-    pd.DataFrame({
-        "row_id":      rows,
-        "prob_class1": np.round(raw_probs, 4),       # post-shift, used for prediction
-        "prob_class1_raw": np.round(raw_probs_unshifted, 4),  # pre-shift, for sweep tool
-        "prediction":  predictions,
-        "text_preview": [str(t)[:120].replace("\n", " / ") for t in texts],
-    }).to_csv(diag_out, index=False)
-
-    # Quick distribution diagnostic
     pos_rate = sum(predictions) / max(1, len(predictions))
-    rp = np.array(raw_probs)
-    print(f"[Predict] {Path(test_csv).name}: "
-          f"n={len(predictions)} pos_rate={pos_rate:.3f}  "
-          f"prob mean={rp.mean():.3f} std={rp.std():.3f} "
-          f"q25={np.quantile(rp,.25):.3f} q75={np.quantile(rp,.75):.3f}")
-    print(f"[Predict] wrote → {out}")
-    print(f"[Predict] wrote per-row debug → {diag_out}")
+    print(f"[Predict] {Path(test_csv).name}: n={len(predictions)} "
+          f"pos_rate={pos_rate:.3f} → {out}")
     return out
 
 

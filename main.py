@@ -13,22 +13,11 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="ICD codability classifier")
-    parser.add_argument("--generate-data",    action="store_true",
-                        help="Generate data pipeline and exit (skip training and inference)")
     parser.add_argument("--skip-data",    action="store_true",
                         help="Skip data pipeline and reuse existing pseudo_labeled.csv")
     parser.add_argument("--predict-only", action="store_true",
                         help="Skip training and run inference from saved checkpoint")
     args = parser.parse_args()
-
-    if args.generate_data:
-        print("=" * 60)
-        print("STAGE 1–5: Data pipeline")
-        print("=" * 60)
-        from data_pipeline import run_pipeline
-        run_pipeline()
-        print("\nData generation complete. Exiting.")
-        sys.exit(0)
 
     if not args.predict_only:
         if not args.skip_data:
