@@ -1,239 +1,100 @@
 """
-Data pipeline — Stages 1 through 5.
+Data pipeline — rewritten to FIX the train/test distribution mismatch.
 
-Stage 1 : Build ICD vocabulary from D_ICD_DIAGNOSES + D_ICD_PROCEDURES
-Stage 2 : Filter NOTEEVENTS (drop errors, keep high-signal categories, sample)
-Stage 3 : Sentence-split each note's TEXT field
-Stage 4 : Three-bucket heuristic labeler (class 1 / class 0 / discard)
-Stage 5 : Balance classes, combine with gold labels, write pseudo_labeled.csv
+OLD PIPELINE (broken):
+  Stage 5a: sentence-level pseudo via regex score.
+  Stage 5b: discharge=1 / radiology=0 — WRONG: many discharge sections are
+            class 0 (Discharge Medications, Discharge Instructions, etc.) and
+            many radiology IMPRESSIONS are class 1 (positive findings).
+
+NEW PIPELINE:
+  Stage 1   : ICD vocabulary (kept).
+  Stage 2   : Filter NOTEEVENTS (kept).
+  Stage 3   : Sentence splitting (kept, only used by 5a).
+  Stage 4   : Heuristic sentence labeler (kept; thresholds tightened).
+  Stage 5a  : Sentence-level pseudo-labels (kept, count reduced).
+  Stage 5c  : NEW — Section-anchored fragment pseudo-labels.
+              Class 1 from: Discharge Diagnosis, Active Issues, Hospital Course
+                            "# Disease:" headers, Past Medical History, Major
+                            Surgical Procedure, positive imaging IMPRESSIONS.
+              Class 0 from: Discharge Medications, Discharge Instructions,
+                            Patient Education, negative/stable IMPRESSIONS,
+                            Social/Family History without disease, micro/lab
+                            result dumps, pure procedural narratives.
+  Stage 5d  : NEW — TF-IDF nearest-neighbor mining anchored to 20 gold examples.
+              For each gold example, retrieve top-K similar candidate fragments
+              from MIMIC and propagate the gold label.
+
+Output: pseudo_labeled.csv with text,label columns. Gold examples are appended
+last so train.py can find them by exact text match.
 """
 
 import re
 import random
-import nltk
-import pandas as pd
+import hashlib
 from pathlib import Path
 
+import nltk
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
 import config
-
-
-# ── Medical stopwords ──────────────────────────────────────────────────────────
-# Common words in ICD titles that carry no discriminative signal
-_MEDICAL_STOPWORDS = {
-    "the", "a", "an", "and", "or", "of", "in", "with", "for", "due",
-    "to", "not", "nos", "nec", "other", "unspecified", "without", "type",
-    "by", "at", "as", "is", "on", "other", "specified", "following",
-    "complicating", "complication", "complications", "associated",
-    "secondary", "subsequent", "encounter", "initial", "history",
-    "personal", "family", "care", "status", "examination",
-}
-
-# ── Class 1 regex patterns ─────────────────────────────────────────────────────
-_PATIENT_PATTERNS = re.compile(
-    r"\b(patient|pt)[\s\w]{0,30}\b"
-    r"(has|had|is|was|were|presents?|presented|reports?|reported|"
-    r"denies?|denied|developed|diagnosed|underwent|complains?|states?)\b",
-    re.IGNORECASE,
-)
-_CLINICAL_FINDING_PATTERNS = re.compile(
-    r"\b(diagnosis of|assessment:|plan:|principal diagnosis|"
-    r"primary diagnosis|acute|chronic)\b",
-    re.IGNORECASE,
-)
-
-# Imaging reports often contain lots of ICD-like terms but are labeled non-codable
-# when the impression is normal/negative or hedged.
-_IMAGING_CONTEXT_PATTERN = re.compile(
-    r"\b(impression|findings|final report|comparison:|compared with|"
-    r"ct\b|mri\b|cta\b|mra\b|ultrasound|u/s|doppler|cxr\b|x-?ray|"
-    r"echocardiogram|tte\b|lvef|ventricular|valve|regurgitation)\b",
-    re.IGNORECASE,
-)
-_NEG_IMAGING_PATTERN = re.compile(
-    r"\b(no evidence of|normal appearance|unremarkable|no acute|"
-    r"unchanged|stable|patent|limited examination|images unavailable|"
-    r"not present|negative for|without evidence of|no significant change|"
-    r"probable degenerative changes|likely benign|no abnormality)\b",
-    re.IGNORECASE,
-)
-
-_PROCEDURE_PATTERN = re.compile(
-    r"\b(s/p|status post|underwent|procedure|repair|stent|orif|"
-    r"intubat(ed|ion)|dialysis|hemodialysis|pci|cath lab)\b",
-    re.IGNORECASE,
-)
-
-# Strong positive: explicit diagnosis/condition statements
-_DIAGNOSIS_PATTERN = re.compile(
-    r"\b(diagnos(is|ed|ed with)|assessment|impression|presents? with|"
-    r"consistent with|findings? (of|consistent)|history of|h/o\b|"
-    r"known (history of|to have)|found to have|confirmed|"
-    r"ruled out|r/o\b|positive for|negative for)\b",
-    re.IGNORECASE,
-)
-
-# Strong positive: procedures with action verbs
-_PROCEDURE_STRONG = re.compile(
-    r"\b(s/p\b|status post|underwent|procedure|repair|stent|orif|"
-    r"intubat(ed|ion)|dialysis|hemodialysis|pci|cath\b|catheterization|"
-    r"resection|biopsy|debridement|amputation|colostomy|tracheostomy|"
-    r"thoracentesis|paracentesis|bronchoscopy|endoscopy|colonoscopy)\b",
-    re.IGNORECASE,
-)
-
-# Specific medical condition terms (high precision)
-_CONDITION_PATTERN = re.compile(
-    r"\b(pneumonia|sepsis|septic|bacteremia|cellulitis|abscess|"
-    r"fracture|laceration|contusion|hemorrhage|hematoma|thrombosis|"
-    r"embolism|infarction|ischemia|necrosis|edema|effusion|"
-    r"insufficiency|failure|obstruction|stenosis|occlusion|"
-    r"hypertension|hypotension|diabetes|diabetic|anemia|"
-    r"infection|infective|inflammatory|malignancy|carcinoma|"
-    r"metastasis|tumor|mass|lesion|ulcer|wound|injury|trauma)\b",
-    re.IGNORECASE,
-)
-
-# Class 0: medication administration (NOT codable by itself)
-_MEDICATION_ADMIN = re.compile(
-    r"\b(given|administered|prescribed|started on|continued on|"
-    r"increased|decreased|titrated|held|discontinued|ordered)\b"
-    r"[\s\w]{0,20}"
-    r"\b(mg|mcg|units?|tabs?|capsules?|drip|infusion|iv\b|po\b|prn\b|qd\b|bid\b|tid\b|qid\b)\b",
-    re.IGNORECASE,
-)
-
-# Class 0: vitals and lab values (NOT codable)
-_VITALS_LABS_PATTERN = re.compile(
-    r"\b(blood pressure|bp\b|heart rate|hr\b|temperature|temp\b|"
-    r"respiratory rate|rr\b|oxygen saturation|spo2|o2 sat|"
-    r"sodium|potassium|creatinine|bun\b|glucose|hemoglobin|hematocrit|"
-    r"wbc\b|platelets?|inr\b|pt\b|ptt\b|ph\b|pco2|po2)\s*"
-    r"[\d\.\-/]+",
-    re.IGNORECASE,
-)
-
-# Class 0: pure plan/instruction statements
-_PLAN_INSTRUCTION = re.compile(
-    r"\b(will (monitor|check|follow|continue|start|hold|obtain|consult)|"
-    r"please (monitor|check|follow|ensure|note|see)|"
-    r"recommend(ed|ation)?|advised|counseled|educated|"
-    r"will be discharged|plan to discharge|anticipate discharge)\b",
-    re.IGNORECASE,
-)
-
-# Catches "afib", "tachycardic", "bradycardic" etc. — these ARE codable
-_CARDIAC_RHYTHM_PATTERN = re.compile(
-    r"\b(afib|atrial fibrillation|tachycardic|tachycardia|"
-    r"bradycardic|bradycardia|flutter|svt\b|vfib|v-?fib|"
-    r"heart block|arrhythmia|palpitations)\b",
-    re.IGNORECASE,
-)
-
-# Negative findings — NOT codable even if disease word present
-_NEGATIVE_FINDING = re.compile(
-    r"\b(no evidence of|without evidence of|negative for|"
-    r"not present|no acute|no active|no new|no significant change|"
-    r"within normal limits|wnl\b|unremarkable|"
-    r"no (?:fracture|mass|lesion|effusion|pneumothorax|"
-    r"infiltrate|consolidation|fistula|abscess|dvt|pe\b))\b",
-    re.IGNORECASE,
-)
-
-# Care directives — NOT codable
-_CARE_DIRECTIVE = re.compile(
-    r"\b(do not (resuscitate|intubate|re-?intubate)|dnr\b|dni\b|"
-    r"comfort (care|measures)|hospice|palliative|"
-    r"is not to be|not to be (re-?intubated|resuscitated)|"
-    r"taken off|weaned off|discontinued|code status)\b",
-    re.IGNORECASE,
-)
-
-# Medication change instructions — NOT codable
-_MED_INSTRUCTION = re.compile(
-    r"\b(you (have been|are|should|will|must|need to)|"
-    r"please (take|continue|stop|avoid|call|return)|"
-    r"take your|your (dose|medication|prescription)|"
-    r"been (started|switched|changed|taken) (on|off|to))\b",
-    re.IGNORECASE,
-)
-
-# ── Class 0 regex patterns ─────────────────────────────────────────────────────
-_DOSAGE_PATTERN = re.compile(
-    r"\b\d+\.?\d*\s*(mg|mcg|ml|mL|units?|tabs?|capsules?|gm|g|mEq|mcg/kg)\b",
-    re.IGNORECASE,
-)
-_HEADER_PATTERN = re.compile(
-    r"^[A-Z][A-Z\s\-/]{3,}:\s*$|^\s*[A-Z][A-Z\s]{3,}\s*$"
-)
-_COMPARATIVE_PATTERN = re.compile(
-    r"\b(compared to|no change|unchanged|stable since|similar to prior|"
-    r"no significant change|no interval change)\b",
-    re.IGNORECASE,
-)
-_ADMIN_PATTERN = re.compile(
-    r"\b(discharge to|transferred to|admitted to|patient expired|"
-    r"follow.?up|see you in|will return|appointment scheduled)\b",
-    re.IGNORECASE,
-)
-_PURE_NUMERIC = re.compile(r"^\s*[\d\.\,\s:/\-]+\s*$")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — ICD vocabulary
 # ─────────────────────────────────────────────────────────────────────────────
 
+_MEDICAL_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "in", "with", "for", "due",
+    "to", "not", "nos", "nec", "other", "unspecified", "without", "type",
+    "by", "at", "as", "is", "on", "specified", "following",
+    "complicating", "complication", "complications", "associated",
+    "secondary", "subsequent", "encounter", "initial", "history",
+    "personal", "family", "care", "status", "examination",
+}
+
+
 def build_icd_term_set() -> frozenset:
-    """
-    Load both ICD tables and extract a set of significant medical terms.
-    Terms are lowercased, length >= 4, and not in the medical stopword list.
-    """
     dfs = []
     for path in (config.ICD_DIAGNOSES_CSV, config.ICD_PROCEDURES_CSV):
         df = pd.read_csv(path, usecols=["SHORT_TITLE", "LONG_TITLE"], dtype=str)
         dfs.append(df)
-
     combined = pd.concat(dfs, ignore_index=True)
-    all_titles = combined["SHORT_TITLE"].dropna().tolist() + \
-                 combined["LONG_TITLE"].dropna().tolist()
-
+    titles = (combined["SHORT_TITLE"].dropna().tolist()
+              + combined["LONG_TITLE"].dropna().tolist())
     terms = set()
-    for title in all_titles:
-        for word in re.findall(r"[a-zA-Z]+", title.lower()):
-            if len(word) >= 4 and word not in _MEDICAL_STOPWORDS:
-                terms.add(word)
-
+    for title in titles:
+        for w in re.findall(r"[a-zA-Z]+", title.lower()):
+            if len(w) >= 4 and w not in _MEDICAL_STOPWORDS:
+                terms.add(w)
     print(f"[Stage 1] ICD vocabulary: {len(terms):,} unique terms")
     return frozenset(terms)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 2 — Filter NOTEEVENTS
+# Stage 2 — NOTEEVENTS loader (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_noteevents() -> pd.DataFrame:
-    """
-    Load NOTEEVENTS, drop error rows, filter to high-signal categories,
-    and return a random sample of MAX_NOTES_TO_SAMPLE rows.
-    """
-    print(f"[Stage 2] Reading NOTEEVENTS (this may take a moment)...")
+def load_noteevents(categories=None, max_n=None) -> pd.DataFrame:
+    cats = categories or config.NOTE_CATEGORIES
+    print(f"[Stage 2] Reading NOTEEVENTS for categories: {cats}")
     df = pd.read_csv(
         config.NOTEEVENTS_CSV,
         usecols=["CATEGORY", "TEXT", "ISERROR"],
-        dtype=str,
-        low_memory=False,
+        dtype=str, low_memory=False,
     )
-
-    # Drop flagged error notes
     df = df[df["ISERROR"].isna() | (df["ISERROR"].str.strip() != "1")]
-
-    # Keep only high-signal note types
-    df = df[df["CATEGORY"].isin(config.NOTE_CATEGORIES)]
+    df = df[df["CATEGORY"].isin(cats)]
     df = df.dropna(subset=["TEXT"])
-
-    # Sample
-    n = min(config.MAX_NOTES_TO_SAMPLE, len(df))
-    df = df.sample(n=n, random_state=config.RANDOM_SEED).reset_index(drop=True)
-    print(f"[Stage 2] Kept {len(df):,} notes after filtering and sampling")
+    if max_n is not None and len(df) > max_n:
+        df = df.sample(n=max_n, random_state=config.RANDOM_SEED).reset_index(drop=True)
+    else:
+        df = df.sample(frac=1, random_state=config.RANDOM_SEED).reset_index(drop=True)
+    print(f"[Stage 2] Loaded {len(df):,} notes — "
+          f"{df['CATEGORY'].value_counts().to_dict()}")
     return df
 
 
@@ -242,391 +103,735 @@ def load_noteevents() -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_sentences(text: str) -> list[str]:
-    """
-    Split a clinical note into individual sentences.
-    Filters out fragments (< 5 words) and sentences exceeding MAX_LENGTH words.
-    """
     try:
         nltk.data.find("tokenizers/punkt")
-        sentences = nltk.sent_tokenize(text)
+        sents = nltk.sent_tokenize(text)
     except LookupError:
-        # Offline-friendly fallback: split on punctuation and newlines.
-        sentences = re.split(r"(?<=[\.!\?])\s+|\n+", text)
-    result = []
-    for s in sentences:
+        sents = re.split(r"(?<=[\.!\?])\s+|\n+", text)
+    out = []
+    for s in sents:
         s = s.strip()
-        word_count = len(s.split())
-        if 5 <= word_count <= config.MAX_LENGTH:
-            result.append(s)
-    return result
+        n = len(s.split())
+        if 5 <= n <= 64:   # keep sentence-sized
+            out.append(s)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 4 — Heuristic labeler
+# Stage 4 — Heuristic sentence labeler (kept; thresholds tightened)
 # ─────────────────────────────────────────────────────────────────────────────
+
+_PURE_NUMERIC = re.compile(r"^\s*[\d\.\,\s:/\-]+\s*$")
+_HEADER_PATTERN = re.compile(r"^[A-Z][A-Z\s\-/]{3,}:\s*$|^\s*[A-Z][A-Z\s]{3,}\s*$")
+
+_NEG_FINDING = re.compile(
+    r"\b(no evidence of|without evidence of|negative for|"
+    r"not present|no acute|no active|no new|no significant change|"
+    r"within normal limits|wnl\b|unremarkable|"
+    r"no (?:fracture|mass|lesion|effusion|pneumothorax|infiltrate|"
+    r"consolidation|fistula|abscess|dvt|pe\b))\b",
+    re.IGNORECASE,
+)
+_CARE_DIRECTIVE = re.compile(
+    r"\b(dnr\b|dni\b|do not (?:resuscitate|intubate)|"
+    r"comfort (?:care|measures)|hospice|palliative|code status)\b",
+    re.IGNORECASE,
+)
+_PATIENT_INSTRUCTION = re.compile(
+    r"\b(you (?:have been|are|should|will|must|need to)|"
+    r"please (?:take|continue|stop|avoid|call|return)|"
+    r"take your (?:medication|pill|dose)|your (?:dose|prescription))\b",
+    re.IGNORECASE,
+)
+_MED_ADMIN = re.compile(
+    r"\b(given|administered|received)\b.{0,30}"
+    r"\b(mg|mcg|mEq|units?|ml\b|iv\b|po\b)\b",
+    re.IGNORECASE,
+)
+_VITALS_LABS = re.compile(
+    r"\b(blood pressure|bp\b|heart rate|hr\b|temperature|temp\b|"
+    r"o2 sat|spo2|sodium|potassium|creatinine|wbc|hgb|inr|troponin|lactate)"
+    r"\s*(is|was|of|:)?\s*[\d\.\-/]+",
+    re.IGNORECASE,
+)
+_SOCIAL_FAMILY = re.compile(
+    r"\b(social history|tobacco|smoking|alcohol|drug use|"
+    r"lives (?:alone|with)|occupation|retired|homeless|family history)\b",
+    re.IGNORECASE,
+)
+
+_PROCEDURE_STRONG = re.compile(
+    r"\b(s/p\b|status post|underwent|procedure performed|repair|stent|orif|"
+    r"intubat(?:ed|ion)|dialysis|hemodialysis|pci\b|catheterization|"
+    r"resection|biopsy|debridement|amputation|colostomy|tracheostomy|"
+    r"thoracentesis|paracentesis|bronchoscopy|endoscopy|colonoscopy|"
+    r"craniotomy|laminectomy)\b",
+    re.IGNORECASE,
+)
+_DIAGNOSIS_FRAMING = re.compile(
+    r"\b(diagnos(?:is|ed|ed with)|consistent with|"
+    r"findings? (?:of|consistent with)|presents? with|"
+    r"history of|h/o\b|known (?:history of|to have)|"
+    r"found to have|confirmed|assessment:|impression:)\b",
+    re.IGNORECASE,
+)
+_CONDITION = re.compile(
+    r"\b(pneumonia|sepsis|septic shock|bacteremia|cellulitis|abscess|"
+    r"fracture|laceration|hemorrhage|hematoma|thrombosis|embolism|"
+    r"infarction|ischemia|necrosis|edema|effusion|insufficiency|failure|"
+    r"obstruction|stenosis|occlusion|hypertension|hypotension|"
+    r"diabetes|diabetic|anemia|infection|malignancy|carcinoma|"
+    r"metastasis|tumor|ulcer|pancreatitis|appendicitis|peritonitis|"
+    r"meningitis|encephalitis|hydrocephalus|stroke|infarct|ischemic|"
+    r"hemorrhagic|dvt\b|pe\b|pulmonary embolism)\b",
+    re.IGNORECASE,
+)
+_CARDIAC_RHYTHM = re.compile(
+    r"\b(afib|a-?fib|atrial fibrillation|atrial flutter|"
+    r"tachycardic|tachycardia|bradycardic|bradycardia|"
+    r"pvc\b|pvcs\b|svt\b|v-?fib|vfib|heart block|arrhythmia)\b",
+    re.IGNORECASE,
+)
+
 
 def label_sentence(sentence: str, icd_terms: frozenset) -> int | None:
-    """
-    Score-based labeler. Accumulate evidence for/against codability.
-    Returns 1, 0, or None (discard ambiguous).
-    """
-    lower = sentence.lower()
-    words = set(re.findall(r"[a-zA-Z]+", lower))
-    word_count = len(sentence.split())
-
-    # ── Hard discard (structural non-sentences) ───────────────────────────
+    """Score-based labeler. Returns 1, 0, or None (discard)."""
     if _PURE_NUMERIC.match(sentence):
         return 0
     if _HEADER_PATTERN.match(sentence):
         return 0
-    if word_count < 4:
+    wc = len(sentence.split())
+    if wc < 4:
         return None
 
-    # ── Scoring ───────────────────────────────────────────────────────────
-    score = 0  # positive = class 1, negative = class 0
+    score = 0
 
-    # === STRONG CLASS 0 SIGNALS (hard veto) ===
-    # Explicit negative findings
-    if re.search(
-        r"\b(no evidence of|without evidence of|negative for|"
-        r"not present|no acute|no active|no new|"
-        r"no (?:fracture|mass|lesion|effusion|pneumothorax|"
-        r"infiltrate|consolidation|fistula|abscess|dvt|pe\b)|"
-        r"within normal limits|wnl\b)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
+    # Strong negatives
+    if _NEG_FINDING.search(sentence):       score -= 4
+    if _CARE_DIRECTIVE.search(sentence):    score -= 4
+    if _PATIENT_INSTRUCTION.search(sentence): score -= 4
+    if _MED_ADMIN.search(sentence):         score -= 2
+    if _VITALS_LABS.search(sentence):       score -= 2
+    if _SOCIAL_FAMILY.search(sentence):     score -= 3
 
-    # Admission/discharge administrative headers
-    if re.search(
-        r"\b(admission date|discharge date|date of admission|"
-        r"date of discharge|date of birth|dob\b)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 5
+    # Strong positives
+    if _PROCEDURE_STRONG.search(sentence):  score += 4
+    if _CARDIAC_RHYTHM.search(sentence):    score += 4
+    if _CONDITION.search(sentence):         score += 3
+    if _DIAGNOSIS_FRAMING.search(sentence): score += 2
 
-    # Radiology exam headers (timestamp + exam type)
-    if re.search(
-        r"\b(portable ap|chest ap|chest pa|ap chest|pa and lateral|"
-        r"chest \(portable\)|chest\s*\(ap\)|upright ap)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
+    # ICD term overlap
+    words = set(re.findall(r"[a-zA-Z]+", sentence.lower()))
+    overlap = len(words & icd_terms)
+    if overlap >= 4:    score += 3
+    elif overlap >= 2:  score += 1
 
-    # Stable existing findings (not new)
-    if re.search(
-        r"\b(stable|unchanged|persistent|known|chronic|existing|"
-        r"previously (noted|seen|identified|described))\b.{0,30}"
-        r"\b(effusion|opacity|atelectasis|lesion|mass|hematoma|"
-        r"opacification|infiltrate|consolidation)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Physical exam headers
-    if re.search(
-        r"^(\[\*\*[\w\s]+\*\*\]\s*)?(physical exam|pe:|vital signs|"
-        r"review of systems|ros:|general:|heent:|cardiovascular:|"
-        r"respiratory:|abdomen:|extremities:|neuro:)\s*$",
-        sentence, re.IGNORECASE
-    ):
-        score -= 5
-
-    # Monitoring/assessment plans without confirmed diagnosis
-    if re.search(
-        r"\b(cont(inue)? to (assess|monitor|watch|follow)|"
-        r"assess for (s/s|signs|symptoms)|"
-        r"monitor for|watch for|follow for)\b",
-        sentence, re.IGNORECASE
-    ) and not re.search(
-        r"\b(sepsis|pneumonia|failure|hemorrhage|infarction|"
-        r"embolism|thrombosis|ischemia)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Normal structures
-    if re.search(
-        r"\b(unremarkable|normal (size|appearance|limits?)|"
-        r"heart is normal|normal cardiomediastinal|"
-        r"no pericardial|patent and normal|grossly normal)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Stable/unchanged imaging
-    if re.search(
-        r"\b(stable|unchanged|no interval change|no significant change)"
-        r".{0,30}(appearance|since|from|compared)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Care directives
-    if re.search(
-        r"\b(dnr\b|dni\b|do not (resuscitate|intubate)|"
-        r"comfort (care|measures)|hospice|palliative|"
-        r"not to be re-?intubated|code status)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
-
-    # Patient-facing instructions
-    if re.search(
-        r"\b(you (have been|are|should|will|must)|"
-        r"please (take|continue|stop|avoid|call|return)|"
-        r"take your (pain|blood|heart|water)|your medication)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
-
-    # Medication administration
-    if re.search(
-        r"\b(given|administered|received)\b.{0,30}"
-        r"\b(mg|mcg|mEq|units?|ml\b|iv\b|po\b)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 2
-
-    # Vitals with numbers
-    if re.search(
-        r"\b(blood pressure|bp\b|heart rate|hr\b|"
-        r"temperature|temp\b|o2 sat|spo2)\s*[\d/\.]+",
-        sentence, re.IGNORECASE
-    ):
-        score -= 2
-
-    # Lab values with numbers
-    if re.search(
-        r"\b(sodium|potassium|creatinine|wbc|hgb|inr|troponin|lactate)"
-        r"\s*(is|was|of|:)?\s*[\d\.]+",
-        sentence, re.IGNORECASE
-    ):
-        score -= 2
-
-    # Social history
-    if re.search(
-        r"\b(social history|tobacco|smoking|alcohol|drug use|"
-        r"lives (alone|with)|occupation|retired|homeless)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Follow-up only
-    if re.search(
-        r"\b(follow.?up (with|in|at)|return (to|in|for)|"
-        r"next appointment|outpatient|primary care)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 2
-
-    # Allergy lines
-    if re.search(
-        r"\b(allergies?|nkda|no known (drug )?allergies?|allergic to)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # "Normal" findings with specific structures
-    if re.search(
-        r"\b(normal (flow|signal|appearing|caliber|contour|echotexture)|"
-        r"is normal|are normal|appears normal|appear normal|"
-        r"grossly normal|essentially normal)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Waiting/monitoring instructions
-    if re.search(
-        r"\b(waiting for|wait for|awaiting|monitoring for|"
-        r"to wake|to be transferred|to go back|will wake)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 3
-
-    # Third-party context (visiting, family member, etc.)
-    if re.search(
-        r"\b(his wife|her husband|his mother|her father|"
-        r"family member|visiting|visitor|accompan)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
-
-    # Medication list lines (numbered drug entries)
-    if re.search(
-        r"^\s*\d+[\.\)]\s+\w+.{5,50}\b(mg|mcg|tablet|capsule|sig:)\b",
-        sentence, re.IGNORECASE
-    ):
-        score -= 4
-
-    # === STRONG CLASS 1 SIGNALS ===
-    # Explicit procedures
-    if re.search(
-        r"\b(s/p\b|status post|underwent|procedure performed|"
-        r"repair|stent|orif|intubat(ed|ion)|dialysis|hemodialysis|"
-        r"pci\b|catheterization|resection|biopsy|debridement|"
-        r"amputation|colostomy|tracheostomy|thoracentesis|"
-        r"paracentesis|bronchoscopy|endoscopy|colonoscopy|"
-        r"thoracentesis|craniotomy|laminectomy)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 4
-
-    # Sinus tachycardia/bradycardia written in monitoring shorthand
-    if re.search(
-        r"\b(sinus tachy|sinus brady|s\.tachy|s\.brady|"
-        r"cvs[:\s].{0,20}(tachy|brady|afib|flutter)|"
-        r"tele[:\s].{0,20}(tachy|brady|afib|pvcs?))\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 4
-
-    # Imaging with new/worsening finding
-    if re.search(
-        r"\b(new|worsening|increasing|progressive|interval increase|"
-        r"interval development|newly|developed|appeared)\b.{0,40}"
-        r"\b(opacity|opacification|effusion|infiltrate|"
-        r"consolidation|atelectasis|mass|lesion|hematoma)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 4
-
-    # Cardiac rhythms/arrhythmias
-    if re.search(
-        r"\b(afib|a-?fib|atrial fibrillation|atrial flutter|"
-        r"tachycardic|tachycardia|bradycardic|bradycardia|"
-        r"pvc\b|pvcs\b|pac\b|pacs\b|svt\b|v-?fib|vfib|"
-        r"heart block|arrhythmia|sinus tach|sinus brady|"
-        r"st elevation|st depression|lbbb|rbbb)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 4
-
-    # Specific diagnoses
-    if re.search(
-        r"\b(pneumonia|sepsis|septic shock|bacteremia|cellulitis|"
-        r"abscess|fracture|laceration|hemorrhage|hematoma|"
-        r"thrombosis|embolism|infarction|ischemia|necrosis|"
-        r"edema|effusion|insufficiency|failure|obstruction|"
-        r"stenosis|occlusion|hypertension|hypotension|"
-        r"diabetes|diabetic|anemia|infection|malignancy|"
-        r"carcinoma|metastasis|tumor|ulcer|pancreatitis|"
-        r"appendicitis|peritonitis|meningitis|encephalitis|"
-        r"hydrocephalus|stroke|infarct|ischemic|hemorrhagic|"
-        r"dvt\b|pe\b|pulmonary embolism|deep vein)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 3
-
-    # Abnormal physical exam findings
-    if re.search(
-        r"\b(\+|positive)\s*(tenderness|guarding|rigidity|rebound)|"
-        r"\b(distended|rigid|tender)\s+(abdomen|belly|abd\b)|"
-        r"\b(decreased|diminished|absent)\s+(breath sounds|bowel sounds|pulses?)|"
-        r"\bsigns? of (infection|inflammation|ischemia|failure)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 3
-
-    # Diagnosis framing language
-    if re.search(
-        r"\b(diagnos(is|ed|ed with)|consistent with|"
-        r"findings? (of|consistent with)|presents? with|"
-        r"history of|h/o\b|known (history of|to have)|"
-        r"found to have|confirmed|assessment:)\b",
-        sentence, re.IGNORECASE
-    ):
-        score += 2
-
-    # ICD term overlap bonus
-    icd_overlap = len(words & icd_terms)
-    if icd_overlap >= 4:
-        score += 3
-    elif icd_overlap >= 2:
-        score += 1
-
-    # Imaging with positive finding (not negated)
-    if re.search(
-        r"\b(impression:|impression\n|IMPRESSION:)\b",
-        sentence, re.IGNORECASE
-    ) and score > 0:
-        score += 2
-
-    # ── Decision ──────────────────────────────────────────────────────────
-    if score >= 4:
-        return 1
-    elif score <= -2:
-        return 0
-    else:
-        return None   # discard ambiguous — cleaner labels beat more data
+    if score >= 4:    return 1
+    if score <= -2:   return 0
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 5 — Build pseudo-labeled dataset
+# Stage 5a — Sentence-level pseudo-labels (unchanged structure, smaller count)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_pseudo_dataset(notes_df: pd.DataFrame, icd_terms: frozenset) -> pd.DataFrame:
+def build_sentence_pseudo(notes_df: pd.DataFrame, icd_terms: frozenset) -> pd.DataFrame:
+    n_per_class = config.MAX_PER_CLASS
     class1, class0 = [], []
-    seen = set()  # deduplicate
-
+    seen = set()
     for text in notes_df["TEXT"]:
-        for sentence in split_sentences(text):
-            if sentence in seen:
+        for s in split_sentences(text):
+            if s in seen:
                 continue
-            seen.add(sentence)
-
-            if len(class1) >= config.MAX_PER_CLASS and \
-               len(class0) >= config.MAX_PER_CLASS:
+            seen.add(s)
+            if len(class1) >= n_per_class and len(class0) >= n_per_class:
                 break
-
-            label = label_sentence(sentence, icd_terms)
-            if label == 1 and len(class1) < config.MAX_PER_CLASS:
-                class1.append(sentence)
-            elif label == 0 and len(class0) < config.MAX_PER_CLASS:
-                class0.append(sentence)
-
-    print(f"[Stage 4/5] Pseudo-labels — class 1: {len(class1):,}, class 0: {len(class0):,}")
+            lab = label_sentence(s, icd_terms)
+            if lab == 1 and len(class1) < n_per_class:
+                class1.append(s)
+            elif lab == 0 and len(class0) < n_per_class:
+                class0.append(s)
+        if len(class1) >= n_per_class and len(class0) >= n_per_class:
+            break
+    print(f"[Stage 5a] Sentence pseudo — class1: {len(class1):,}, class0: {len(class0):,}")
     rows = [(s, 1) for s in class1] + [(s, 0) for s in class0]
     random.shuffle(rows)
     return pd.DataFrame(rows, columns=["text", "label"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main entry point
+# Stage 5c — Section-anchored fragment pseudo-labels  (THE BIG FIX)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Strategy:  Don't use note CATEGORY as the label signal. Instead, find specific
+# named sections within a note and label by section type. This matches how the
+# 20 gold examples were actually labeled (we verified by inspection).
+#
+# Each section regex captures an anchor; we extract from the anchor up to a
+# target word count. This produces fragments that look like the gold examples.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CLASS 1 section anchors  (codable: name diseases / procedures / problems)
+_SEC1_DISCHARGE_DX = re.compile(
+    r"(discharge\s+diagnosis|primary\s+diagnosis|principal\s+diagnosis|"
+    r"admitting\s+diagnosis|secondary\s+diagnosis|active\s+issues|"
+    r"problem\s+list)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC1_HOSPITAL_COURSE_PROBLEM = re.compile(
+    # "# Cardiogenic Shock:" style problem-anchored hospital course chunks
+    r"(?:^|\n)\s*#+\s*[A-Z][A-Za-z][^\n]{2,80}:\s",
+)
+_SEC1_PMH = re.compile(
+    r"(past\s+medical\s+history|pmh|cardiac\s+history|"
+    r"medical\s+history)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC1_SURGICAL = re.compile(
+    r"(major\s+surgical\s+(?:or\s+invasive\s+)?procedure|"
+    r"surgical\s+procedures?\s+performed|operative\s+procedure)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC1_HPI = re.compile(
+    r"(history\s+of\s+present\s+illness|hpi)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC1_BRIEF_HOSPITAL_COURSE = re.compile(
+    r"(brief\s+hospital\s+course|hospital\s+course)\s*[:\n]",
+    re.IGNORECASE,
+)
+
+# A second `#` header within the next ~80 words is a sign of a *multi-problem*
+# narrative chunk — looks like row 8 from the test, which is class 0.
+# A single `#` header followed by sustained narrative is a focused problem
+# block (class 1, like the gold "# Cardiogenic Shock:" example).
+_MULTI_HASH_NEXT80 = re.compile(
+    r"(?:^|\n)\s*#+\s*[A-Z]"
+)
+
+# CLASS 0 section anchors  (NOT codable: instructions, dispensing, narratives)
+_SEC0_DISCHARGE_MEDS = re.compile(
+    r"(discharge\s+medications?|medications?\s+on\s+discharge)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC0_DISCHARGE_INSTR = re.compile(
+    r"(discharge\s+instructions?|patient\s+instructions?|"
+    r"followup\s+instructions?|follow-?up\s+instructions?)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC0_SOCIAL = re.compile(
+    r"(social\s+history|family\s+history)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC0_ALLERGIES = re.compile(
+    r"(allergies?)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC0_DISPOSITION = re.compile(
+    r"(discharge\s+disposition|discharge\s+condition)\s*[:\n]",
+    re.IGNORECASE,
+)
+_SEC0_PHYS_EXAM = re.compile(
+    r"(physical\s+exam|physical\s+examination|review\s+of\s+systems)\s*[:\n]",
+    re.IGNORECASE,
+)
+
+# Numbered-list-style medication entry markers — strong class 0 signal
+_NUMBERED_MED_LINE = re.compile(
+    r"^\s*\d+\.\s+\w+.{0,40}\b(mg|mcg|tablet|capsule|sig:|po\b|iv\b|disp:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_window(text: str, start: int, target_words: int) -> str:
+    """Take a fragment starting at `start` containing target_words words."""
+    fragment = text[start:]
+    words = fragment.split()
+    return " ".join(words[:target_words])
+
+
+def _classify_imaging_impression(impression_text: str) -> int | None:
+    """Imaging impressions: positive → class 1, negative/stable → class 0."""
+    pos_signals = 0
+    neg_signals = 0
+
+    if re.search(r"\b(no evidence of|negative for|unremarkable|normal "
+                 r"(?:appearance|size)|within normal limits|wnl\b|"
+                 r"no acute|no significant change|stable|unchanged|"
+                 r"no new|patent|no abnormality|likely benign)\b",
+                 impression_text, re.IGNORECASE):
+        neg_signals += 2
+    if re.search(r"\b(images unavailable|limited examination|"
+                 r"comparison.*not available)\b",
+                 impression_text, re.IGNORECASE):
+        neg_signals += 2
+
+    # Positive: explicit new/worsening finding or named pathology
+    if re.search(r"\b(new|worsening|increased|interval increase|developing|"
+                 r"progressive|appeared|developed|enlargement|enlarging)\b.{0,40}"
+                 r"\b(opacity|effusion|hemorrhage|infarct|edema|mass|lesion|"
+                 r"hematoma|consolidation|infiltrate|fracture|stenosis)\b",
+                 impression_text, re.IGNORECASE):
+        pos_signals += 3
+    if re.search(r"\b(pneumonia|sepsis|infarction|hemorrhage|embolism|"
+                 r"thrombosis|fracture|aneurysm|stenosis|occlusion|"
+                 r"obstruction|abscess|metastasis|carcinoma|malignancy|"
+                 r"hydrocephalus|pneumothorax|cellulitis|appendicitis|"
+                 r"diverticulitis|cholecystitis|pancreatitis)\b",
+                 impression_text, re.IGNORECASE):
+        pos_signals += 2
+    if re.search(r"\b(concerning for|suspicious for|consistent with|"
+                 r"compatible with|worrisome for)\b",
+                 impression_text, re.IGNORECASE):
+        pos_signals += 1
+
+    if pos_signals >= 2 and neg_signals <= 1:
+        return 1
+    if neg_signals >= 2 and pos_signals == 0:
+        return 0
+    return None  # ambiguous
+
+
+def _build_section_fragments(notes_df: pd.DataFrame) -> tuple[list, list]:
+    """
+    Walk every note, extract section-anchored fragments, label by section type.
+    Returns (class1_list, class0_list).
+    """
+    target = config.SECTION_FRAG_TARGET_WORDS
+    n_max  = config.SECTION_FRAG_PER_CLASS
+    minw   = config.SECTION_FRAG_MIN_WORDS
+    maxw   = config.SECTION_FRAG_MAX_WORDS
+
+    class1, class0 = [], []
+    seen_hashes = set()
+
+    def _add(text: str, cls: int) -> bool:
+        wc = len(text.split())
+        if wc < minw or wc > maxw:
+            return False
+        h = hashlib.md5(text.encode()).hexdigest()
+        if h in seen_hashes:
+            return False
+        seen_hashes.add(h)
+        if cls == 1 and len(class1) < n_max:
+            class1.append(text); return True
+        if cls == 0 and len(class0) < n_max:
+            class0.append(text); return True
+        return False
+
+    n_notes = len(notes_df)
+    for i, row in enumerate(notes_df.itertuples(index=False), 1):
+        if i % 1000 == 0:
+            print(f"[Stage 5c]   processed {i:,}/{n_notes:,} notes — "
+                  f"c1={len(class1):,} c0={len(class0):,}")
+        if len(class1) >= n_max and len(class0) >= n_max:
+            break
+
+        text = str(getattr(row, "TEXT", "") or "").strip()
+        cat  = str(getattr(row, "CATEGORY", "") or "").strip()
+        if len(text.split()) < 30:
+            continue
+
+        # ── CLASS 1 anchors (HIGH-CONFIDENCE) ─────────────────────────────
+        # Discharge Diagnosis, Active Issues, etc. — these are focused
+        # diagnostic listings. Past Medical History — patient has these
+        # conditions. Surgical Procedure — explicit named procedure.
+        # HPI — patient presentation/diagnosis statement.
+        # Brief Hospital Course — RESTORED in round 3-fix. Most BHC fragments
+        # are class 1 in gold (including multi-`#` chunks like "# Bilateral
+        # hearing loss" which is gold-labeled 1). Removing it in round 2
+        # caused a regression.
+        for pat in (_SEC1_DISCHARGE_DX, _SEC1_PMH, _SEC1_SURGICAL,
+                    _SEC1_HPI, _SEC1_BRIEF_HOSPITAL_COURSE):
+            for m in pat.finditer(text):
+                frag = _extract_window(text, m.start(), target)
+                # Hard veto: drop fragments dominated by numbered med list
+                if len(_NUMBERED_MED_LINE.findall(frag)) >= 2:
+                    continue
+                _add(frag, 1)
+                if len(class1) >= n_max:
+                    break
+
+        # # Disease: style hospital course chunks → class 1.
+        # Both single-problem AND multi-problem `#` blocks count as class 1
+        # in gold (e.g. gold example #7 has multiple `#` headers and is
+        # class 1). The round-2 multi-hash demotion was wrong.
+        for m in _SEC1_HOSPITAL_COURSE_PROBLEM.finditer(text):
+            frag = _extract_window(text, m.start(), target)
+            # Skip if it looks like disposition/instructions
+            if re.search(r"\b(discharge|disposition|instructions)\b",
+                         frag[:60], re.IGNORECASE):
+                continue
+            _add(frag, 1)
+            if len(class1) >= n_max:
+                break
+
+        # ── CLASS 0 anchors ────────────────────────────────────────────────
+        for pat in (_SEC0_DISCHARGE_MEDS, _SEC0_DISCHARGE_INSTR,
+                    _SEC0_SOCIAL, _SEC0_DISPOSITION, _SEC0_PHYS_EXAM):
+            for m in pat.finditer(text):
+                frag = _extract_window(text, m.start(), target)
+                _add(frag, 0)
+                if len(class0) >= n_max:
+                    break
+
+        # ── Imaging IMPRESSION (radiology only) — class depends on content ──
+        if cat == "Radiology":
+            for m in re.finditer(r"\b(?:IMPRESSION|FINDINGS|CONCLUSION)\s*:\s*",
+                                 text):
+                frag = _extract_window(text, m.start(), target)
+                cls = _classify_imaging_impression(frag)
+                if cls is not None:
+                    _add(frag, cls)
+                if len(class1) >= n_max and len(class0) >= n_max:
+                    break
+            # ROUND 3-FIX-2: REMOVED radiology body addition. It made the
+            # model slightly more class-1-biased (gold acc went 0.95 → 0.85)
+            # which negated the benefit of prior shift. Cleaner round-2
+            # pipeline + prior shift on top works better.
+
+    print(f"[Stage 5c] Section fragments — class1: {len(class1):,}, "
+          f"class0: {len(class0):,}")
+    return class1, class0
+
+
+def build_section_pseudo(notes_df: pd.DataFrame) -> pd.DataFrame:
+    if config.SECTION_FRAG_PER_CLASS <= 0:
+        return pd.DataFrame(columns=["text", "label"])
+    class1, class0 = _build_section_fragments(notes_df)
+    rows = [(t, 1) for t in class1] + [(t, 0) for t in class0]
+    random.shuffle(rows)
+    return pd.DataFrame(rows, columns=["text", "label"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 5d — TF-IDF nearest-neighbor mining anchored to gold (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# For each of the 20 gold examples, find the K most-similar candidate fragments
+# in MIMIC and propagate the gold label. This produces training data that
+# *actually looks like* the test data — closing the train/test domain gap.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _candidate_fragments_for_neighbor_mining(notes_df: pd.DataFrame,
+                                             max_per_note: int = 3) -> list[str]:
+    """
+    Generate fragment candidates by sliding ~100-word windows over every note
+    starting at section anchors and at every double-newline.
+    """
+    target = config.SECTION_FRAG_TARGET_WORDS
+    minw   = config.SECTION_FRAG_MIN_WORDS
+    maxw   = config.SECTION_FRAG_MAX_WORDS
+    candidates = []
+    seen = set()
+
+    section_re = re.compile(
+        r"(?:" + "|".join([
+            r"discharge\s+diagnosis", r"primary\s+diagnosis",
+            r"principal\s+diagnosis", r"admitting\s+diagnosis",
+            r"active\s+issues", r"past\s+medical\s+history",
+            r"history\s+of\s+present\s+illness", r"hpi",
+            r"brief\s+hospital\s+course", r"hospital\s+course",
+            r"discharge\s+medications?", r"discharge\s+instructions?",
+            r"social\s+history", r"family\s+history",
+            r"allergies", r"physical\s+exam", r"discharge\s+condition",
+            r"discharge\s+disposition", r"impression",
+            r"major\s+surgical", r"#+\s*[A-Z][A-Za-z][^\n]{2,40}:",
+        ]) + r")",
+        re.IGNORECASE,
+    )
+
+    for row in notes_df.itertuples(index=False):
+        text = str(getattr(row, "TEXT", "") or "").strip()
+        if len(text.split()) < 30:
+            continue
+        anchors = [m.start() for m in section_re.finditer(text)]
+        # Add a few generic anchors at paragraph breaks
+        anchors += [m.start() for m in re.finditer(r"\n\s*\n", text)]
+        anchors = sorted(set(anchors))[: max_per_note * 3]
+
+        for a in anchors[:max_per_note]:
+            frag = _extract_window(text, a, target)
+            wc = len(frag.split())
+            if wc < minw or wc > maxw:
+                continue
+            h = hashlib.md5(frag.encode()).hexdigest()
+            if h in seen:
+                continue
+            seen.add(h)
+            candidates.append(frag)
+    return candidates
+
+
+def _bert_encode_batch(texts: list[str], tokenizer, encoder,
+                        device, max_len: int = 256, bs: int = 32) -> "np.ndarray":
+    """
+    Mean-pool Bio_ClinicalBERT embeddings for a list of texts.
+    Returns shape (n, hidden_size). Used for semantic similarity in Stage 5d.
+    """
+    import torch
+    import numpy as _np
+    encoder.eval()
+    out = []
+    with torch.no_grad():
+        for start in range(0, len(texts), bs):
+            batch = texts[start: start + bs]
+            enc = tokenizer(batch, max_length=max_len, truncation=True,
+                            padding="max_length", return_tensors="pt")
+            ids  = enc["input_ids"].to(device)
+            mask = enc["attention_mask"].to(device)
+            outputs = encoder(input_ids=ids, attention_mask=mask)
+            tok = outputs.last_hidden_state         # (B, L, H)
+            m = mask.unsqueeze(-1).float()
+            pooled = (tok * m).sum(1) / m.sum(1).clamp(min=1e-9)  # (B, H)
+            # L2-normalize for cosine sim
+            pooled = pooled / pooled.norm(dim=1, keepdim=True).clamp(min=1e-9)
+            out.append(pooled.cpu().numpy())
+    return _np.concatenate(out, axis=0) if out else _np.zeros((0, 768))
+
+
+# Class-0 patterns used in hard-negative filtering — these texts LOOK class-1
+# (by lexical similarity to gold class 1) but contain unmistakable class-0
+# narrative cues like "will continue", "at the time of discharge", "should be
+# transitioned". When such a candidate is a top match for a class-1 gold
+# example, it's a HARD NEGATIVE: similar to class 1 but actually class 0.
+# We label them class 0 explicitly to teach the model the contrast.
+_HARD_NEGATIVE_CUES = re.compile(
+    r"\b(at the time of discharge|will continue this for|"
+    r"should be transitioned to|please (?:take|continue|stop|avoid|call|return)|"
+    r"poor candidate for|disp:\s*\*\d+|sig:\s*(?:one|two|three|\d+)|"
+    r"refills?:?\s*\*?\d|"
+    r"reported to and read back|gram positive cocci|gram negative|"
+    r"compared with the (?:report of the )?prior study|"
+    r"images unavailable for review|limited examination|"
+    r"are pending at the time of|labs?\s+pending|results pending)\b",
+    re.IGNORECASE,
+)
+
+# CRITICAL: positive overrides. Two gold class-1 examples matched the
+# hard-negative cue regex (because they include "Sig: One" and "Disp:*16"
+# *followed by* a Discharge Diagnosis listing). If a candidate matches the
+# hard-negative cues AND has any of these positive overrides, it's NOT a
+# hard negative — leave it for the regular neighbor mining pass.
+_HARD_NEG_POSITIVE_OVERRIDE = re.compile(
+    r"\b(discharge\s+diagnosis|primary\s+diagnosis|principal\s+diagnosis|"
+    r"admitting\s+diagnosis|active\s+issues?|past\s+medical\s+history|"
+    r"history\s+of\s+present\s+illness|major\s+surgical\s+(?:or\s+invasive\s+)?procedure|"
+    r"cardiac\s+history|chief\s+complaint)\s*[:\n]",
+    re.IGNORECASE,
+)
+
+
+def _is_hard_negative(text: str) -> bool:
+    """True iff text matches HARD_NEGATIVE_CUES and NOT POSITIVE_OVERRIDE."""
+    if _HARD_NEG_POSITIVE_OVERRIDE.search(text):
+        return False
+    return bool(_HARD_NEGATIVE_CUES.search(text))
+
+
+def build_neighbor_pseudo(notes_df: pd.DataFrame,
+                          gold_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mine class-1 neighbors AND hard negatives for each gold example using
+    Bio_ClinicalBERT semantic embeddings.
+
+    For each gold class-1 example:
+      - top-K most-similar candidates → label class 1
+      - candidates above a fairly-similar threshold (>0.50 SBERT-style) that
+        ALSO match _HARD_NEGATIVE_CUES → label class 0 (hard negatives)
+
+    For each gold class-0 example:
+      - top-K most-similar candidates → label class 0
+    """
+    if config.NEIGHBOR_PER_GOLD <= 0:
+        return pd.DataFrame(columns=["text", "label"])
+
+    import torch
+    from model import load_tokenizer
+    from transformers import AutoModel
+
+    print("[Stage 5d] Generating candidate pool for neighbor mining...")
+    # ROUND-FIX: throttle candidate count to stay within runtime budget.
+    # 80k candidates is enough diversity for 20 gold seeds with K~30 each.
+    per_note = int(getattr(config, "NEIGHBOR_CANDIDATES_PER_NOTE", 4))
+    cap      = int(getattr(config, "NEIGHBOR_CANDIDATE_POOL", 80_000))
+
+    candidates_full = _candidate_fragments_for_neighbor_mining(notes_df,
+                                                                max_per_note=per_note)
+    if len(candidates_full) > cap:
+        rng = random.Random(config.RANDOM_SEED)
+        rng.shuffle(candidates_full)
+        candidates = candidates_full[:cap]
+    else:
+        candidates = candidates_full
+    print(f"[Stage 5d]   {len(candidates_full):,} → {len(candidates):,} candidate fragments")
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=["text", "label"])
+
+    # ── Embedding ─────────────────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Stage 5d] Loading Bio_ClinicalBERT for embedding (device={device})...")
+    # IMPORTANT: use the same MODEL_NAME from model.py which respects the
+    # MODEL_PATH env var (Grace cluster has it pointed at a local path).
+    # Using config.MODEL_NAME directly fails with OSError because it tries
+    # to download from huggingface.co.
+    from model import MODEL_NAME as _BERT_MODEL_NAME
+    tokenizer = load_tokenizer()
+    encoder   = AutoModel.from_pretrained(
+        _BERT_MODEL_NAME,
+        local_files_only=True,
+    ).to(device)
+
+    gold_texts = gold_df["text"].tolist()
+    gold_labels = gold_df["label"].astype(int).tolist()
+
+    print("[Stage 5d] Embedding gold (n=20)...")
+    G = _bert_encode_batch(gold_texts, tokenizer, encoder, device)
+
+    print(f"[Stage 5d] Embedding {len(candidates):,} candidates...")
+    # Larger batch for candidates since we don't backprop
+    C = _bert_encode_batch(candidates, tokenizer, encoder, device, bs=64)
+
+    # Free the encoder before training kicks in
+    del encoder
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Cosine similarity (G and C are L2-normalized → dot product = cosine)
+    print("[Stage 5d] Computing similarities...")
+    sims = G @ C.T          # (20, n_candidates)
+
+    K = int(config.NEIGHBOR_PER_GOLD)
+    min_sim = float(config.NEIGHBOR_MIN_SIM)
+    hard_neg_min_sim = float(getattr(config, "HARD_NEG_MIN_SIM", 0.50))
+
+    used_candidate_idx = set()
+    chosen = []   # (text, label, sim, gold_idx, source)
+
+    # Pass 1: for each gold example, pick top-K disjoint same-class neighbors
+    for gi in range(len(gold_texts)):
+        order = np.argsort(-sims[gi])
+        picked = 0
+        for ci in order:
+            if picked >= K:
+                break
+            ci = int(ci)
+            if ci in used_candidate_idx:
+                continue
+            s = sims[gi, ci]
+            if s < min_sim:
+                break
+            used_candidate_idx.add(ci)
+            chosen.append((candidates[ci], gold_labels[gi], float(s), gi, "neighbor"))
+            picked += 1
+
+    # Pass 2: hard negatives. For each class-1 gold example, find candidates
+    # with high similarity (≥ hard_neg_min_sim) that ALSO match the hard-
+    # negative cue regex. Label them class 0.
+    n_hard_neg = 0
+    hard_neg_per_gold = int(getattr(config, "HARD_NEG_PER_GOLD", 10))
+    for gi, gl in enumerate(gold_labels):
+        if gl != 1:
+            continue
+        order = np.argsort(-sims[gi])
+        picked = 0
+        for ci in order:
+            if picked >= hard_neg_per_gold:
+                break
+            ci = int(ci)
+            if ci in used_candidate_idx:
+                continue
+            s = sims[gi, ci]
+            if s < hard_neg_min_sim:
+                break
+            cand_text = candidates[ci]
+            if _is_hard_negative(cand_text):
+                used_candidate_idx.add(ci)
+                chosen.append((cand_text, 0, float(s), gi, "hard_neg"))
+                picked += 1
+                n_hard_neg += 1
+
+    df = pd.DataFrame(chosen, columns=["text", "label", "sim", "gold_idx", "source"])
+    n1 = (df["label"] == 1).sum()
+    n0 = (df["label"] == 0).sum()
+    print(f"[Stage 5d] Mined {len(df):,} fragments — "
+          f"class1: {n1:,}, class0: {n0:,} "
+          f"(of which {n_hard_neg:,} are hard negatives)")
+    if len(df) > 0:
+        print(f"[Stage 5d]   sim quartiles: "
+              f"min={df['sim'].min():.3f} 25%={df['sim'].quantile(.25):.3f} "
+              f"50%={df['sim'].median():.3f} max={df['sim'].max():.3f}")
+    return df[["text", "label"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline() -> pd.DataFrame:
-    """
-    Execute all 5 stages and write pseudo_labeled.csv.
-    Also appends the 20 gold training examples so the final CSV
-    contains everything the training loop needs.
-    Returns the combined DataFrame.
-    """
     random.seed(config.RANDOM_SEED)
+    np.random.seed(config.RANDOM_SEED)
 
     # Stage 1
     icd_terms = build_icd_term_set()
 
-    # Stage 2
-    notes_df = load_noteevents()
+    # Stage 2 — sentence pseudo-labels use the sampled subset for speed
+    notes_sample = load_noteevents(max_n=config.MAX_NOTES_TO_SAMPLE)
 
-    # Stages 3–5
-    pseudo_df = build_pseudo_dataset(notes_df, icd_terms)
+    # Stage 5a
+    sentence_df = build_sentence_pseudo(notes_sample, icd_terms)
 
-    # Load gold examples and append
-    gold_df = pd.read_csv(config.TRAIN_CSV, dtype=str)
-    # Normalise column names — instructor CSV may vary
-    gold_df.columns = [c.strip().lower() for c in gold_df.columns]
-    text_col  = next(c for c in gold_df.columns if "text" in c)
-    label_col = next(c for c in gold_df.columns if "label" in c)
-    gold_df = gold_df[[text_col, label_col]].rename(
-        columns={text_col: "text", label_col: "label"}
+    # Stage 5c & 5d use the FULL notes set (no sample cap) so we have enough
+    # supply of every section type and rich neighbor mining material.
+    print("[Pipeline] Loading full notes for section + neighbor mining...")
+    notes_full = load_noteevents(
+        categories=["Discharge summary", "Radiology", "Physician"],
+        max_n=None,
     )
+
+    # Stage 5c
+    section_df = build_section_pseudo(notes_full)
+
+    # Stage 5d — load gold for neighbor mining
+    gold_df = pd.read_csv(config.TRAIN_CSV, dtype=str)
+    gold_df.columns = [c.strip().lower() for c in gold_df.columns]
+    tc = next(c for c in gold_df.columns if "text" in c)
+    lc = next(c for c in gold_df.columns if "label" in c)
+    gold_df = gold_df[[tc, lc]].rename(columns={tc: "text", lc: "label"})
     gold_df["label"] = gold_df["label"].astype(int)
 
+    neighbor_df = build_neighbor_pseudo(notes_full, gold_df)
+
+    # Combine all pseudo sources
+    pseudo_df = pd.concat([sentence_df, section_df, neighbor_df],
+                          ignore_index=True)
+    pseudo_df["label"] = pseudo_df["label"].astype(int)
+
+    # Drop any pseudo row whose text exactly matches gold (so evaluation is clean)
+    gold_text_set = set(gold_df["text"].tolist())
+    before = len(pseudo_df)
+    pseudo_df = pseudo_df[~pseudo_df["text"].isin(gold_text_set)].reset_index(drop=True)
+    print(f"[Pipeline] Removed {before - len(pseudo_df)} pseudo rows that "
+          f"matched gold text")
+
+    pseudo_df = pseudo_df.drop_duplicates(subset=["text"]).reset_index(drop=True)
+    pseudo_df = pseudo_df.sample(frac=1, random_state=config.RANDOM_SEED) \
+                          .reset_index(drop=True)
+
+    # Append gold to the end so train.py can locate them
     combined = pd.concat([pseudo_df, gold_df], ignore_index=True)
     combined.to_csv(config.PSEUDO_LABEL_CSV, index=False)
-    print(f"[Pipeline] Wrote {len(combined):,} rows → {config.PSEUDO_LABEL_CSV}")
+
+    print(f"\n[Pipeline] FINAL composition:")
+    print(f"  Sentence (5a)  : {len(sentence_df):,}")
+    print(f"  Section  (5c)  : {len(section_df):,}")
+    print(f"  Neighbor (5d)  : {len(neighbor_df):,}")
+    print(f"  Pseudo total   : {len(pseudo_df):,}")
+    print(f"  Gold appended  : {len(gold_df):,}")
+    print(f"  Combined       : {len(combined):,} → {config.PSEUDO_LABEL_CSV}")
+    print(f"  Pseudo class balance: "
+          f"class0={(pseudo_df['label']==0).sum():,} "
+          f"class1={(pseudo_df['label']==1).sum():,}")
     return combined
 
 
