@@ -32,8 +32,8 @@ PSEUDO_LABEL_CSV = PROJECT_ROOT / "pseudo_labeled.csv"
 
 # ─── Model / tokenization ───────────────────────────────────────────────────
 MODEL_NAME  = "emilyalsentzer/Bio_ClinicalBERT"
-MAX_WORDS   = 128              # max input words (per project spec)
-MAX_LENGTH  = 170              # ~128 words ≈ 170 tokens
+MAX_WORDS   = 128         # max input words (per project spec)
+MAX_LENGTH  = 256              # max tokens after BERT tokenization
 DOC_STRIDE  = 64               # sliding-window stride for long fragments
 DOC_AGG     = "mean_topk"      # aggregation across windows: max | mean | mean_topk
 DOC_TOPK    = 3                # top-k window probabilities to average
