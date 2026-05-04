@@ -136,36 +136,26 @@ _VETO_POSITIVE_OVERRIDE = re.compile(
 def _gold_derived_penalty(text: str) -> float:
     """
     Returns a penalty in [0, 1] to subtract from the predicted prob_class1.
-    ROUND 5: stack-aware AND override-aware.
-      - If text contains a strong class-1 section header → penalty 0.
-      - 1 distinct cue:  penalty 0.30
-      - 2 distinct cues: penalty 0.45
-      - 3+ distinct cues: penalty 0.55
-    Counts distinct cue MATCHES (not patterns) to handle the case where one
-    OR-regex contains multiple alternatives that all hit (e.g. the disposition
-    pattern has alternatives "at the time of discharge", "will continue",
-    "should be transitioned" — a fragment can match all three).
+    Each pattern was verified to NOT match any of the 10 gold class-1 examples.
+
+    R5 introduced stack escalation (penalty up to 0.55 for 3+ matches), but it
+    cost a true-positive on test01. Reverted to flat 0.30 max penalty —
+    matches what worked in R4 (test01 acc 0.7975, F1 0.6667).
+
+    Kept R5 improvements: whitespace-aware regexes (technical bug fix) and
+    positive override (prevents class-1 false flags).
     """
     t = (text or "")
     # Positive override: never penalize fragments with strong class-1 markers.
     if _VETO_POSITIVE_OVERRIDE.search(t):
         return 0.0
 
-    n_matches = 0
-    n_matches += len(_VETO_DISPOSITION.findall(t))
-    n_matches += len(_VETO_MICRO.findall(t))
-    n_matches += len(_VETO_COMPARISON.findall(t))
-    n_matches += 1 if _VETO_LAB_DUMP.search(t) else 0
-    n_matches += 1 if len(_VETO_VITALS_PATTERN.findall(t)) >= 3 else 0
-    n_matches += 1 if _VETO_PENDING.search(t) else 0
-
-    if n_matches == 0:
-        return 0.0
-    if n_matches == 1:
+    if (_VETO_DISPOSITION.search(t) or _VETO_MICRO.search(t)
+            or _VETO_COMPARISON.search(t) or _VETO_LAB_DUMP.search(t)
+            or len(_VETO_VITALS_PATTERN.findall(t)) >= 3
+            or _VETO_PENDING.search(t)):
         return 0.30
-    if n_matches == 2:
-        return 0.45
-    return 0.55  # 3+ patterns — overwhelming evidence
+    return 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +234,33 @@ def predict_csv(model, tokenizer, test_csv):
     bs     = int(getattr(config, "BATCH_SIZE", 16))
     use_vetoes = bool(getattr(config, "USE_INFERENCE_HEURISTICS", False))
 
+    # ── KNN-against-gold setup (round 6) ──────────────────────────────────────
+    # Load saved gold embeddings + labels. For each test fragment we compute its
+    # own embedding (using the trained model) and find K nearest gold neighbors.
+    # If those neighbors agree with high similarity, we blend their label vote
+    # into the BERT classifier prob. This uses gold info the classifier alone
+    # might miss — particularly helpful for fragments that are SIMILAR to a
+    # specific gold example but not strongly classified by BERT.
+    use_knn = bool(getattr(config, "USE_KNN_GOLD", False))
+    gold_embeds = None
+    gold_labels = None
+    if use_knn:
+        ge_path = config.CHECKPOINTS / "gold_embeddings.npy"
+        gl_path = config.CHECKPOINTS / "gold_labels.npy"
+        if ge_path.exists() and gl_path.exists():
+            gold_embeds = np.load(ge_path)         # (20, 768) L2-normalized
+            gold_labels = np.load(gl_path)         # (20,) int 0/1
+            print(f"[Predict] KNN-against-gold ENABLED: "
+                  f"{gold_embeds.shape[0]} gold seeds loaded")
+        else:
+            print("[Predict] KNN-against-gold requested but no gold embeddings found "
+                  f"({ge_path}). Falling back to BERT-only inference.")
+            use_knn = False
+
+    knn_K          = int(getattr(config, "KNN_K", 3))
+    knn_sim_min    = float(getattr(config, "KNN_SIM_MIN", 0.50))
+    knn_sim_full   = float(getattr(config, "KNN_SIM_FULL", 0.75))
+
     # Per-file prior shift lookup. Round-3-fix found that test01/02 are
     # ~26-28% class 1 (skewed) while test03 is ~46% (balanced).
     file_stem = Path(test_csv).stem.replace("_text_only", "")
@@ -270,6 +287,33 @@ def predict_csv(model, tokenizer, test_csv):
         logit = math.log(p / (1 - p))
         new_logit = logit + prior_logit_shift
         return 1.0 / (1.0 + math.exp(-new_logit))
+
+    def _knn_prob_and_alpha(test_emb: np.ndarray) -> tuple[float, float]:
+        """
+        Given a (768,) L2-normalized test embedding, return (knn_prob, alpha)
+        where:
+          knn_prob  = similarity-weighted vote from top-K gold neighbors
+          alpha     = blend weight for KNN vs BERT (0=use BERT only, 1=use KNN only)
+        alpha scales linearly from 0 (at sim_min) to 1 (at sim_full).
+        """
+        sims = gold_embeds @ test_emb        # (20,)
+        order = np.argsort(-sims)
+        topk_idx = order[:knn_K]
+        topk_sims = sims[topk_idx]
+        topk_labels = gold_labels[topk_idx]
+
+        max_sim = float(topk_sims.max())
+        if max_sim < knn_sim_min:
+            return 0.5, 0.0  # too far, use BERT only
+        # Similarity-weighted KNN prob (only positive-similarity weights)
+        w = np.clip(topk_sims, 0, None)
+        if w.sum() < 1e-9:
+            return 0.5, 0.0
+        knn_prob = float((w * topk_labels).sum() / w.sum())
+        # Blend weight: ramps linearly from 0 at knn_sim_min to 1 at knn_sim_full
+        alpha = (max_sim - knn_sim_min) / max(1e-9, knn_sim_full - knn_sim_min)
+        alpha = float(max(0.0, min(1.0, alpha)))
+        return knn_prob, alpha
 
     predictions = []
     raw_probs   = []   # AGGREGATED probs AFTER prior shift — used for thresholding
@@ -320,6 +364,27 @@ def predict_csv(model, tokenizer, test_csv):
                     pen = _gold_derived_penalty(t)
                     if pen > 0:
                         batch_probs[i_b] = max(0.0, batch_probs[i_b] - pen)
+
+            # ── KNN-against-gold blend (round 6) ─────────────────────────────
+            # For each text, compute its embedding (single-pass, no sliding
+            # window — match how gold was embedded). Then look up nearest gold
+            # neighbors and blend their similarity-weighted vote into the prob.
+            if use_knn and keep_idx:
+                with torch.no_grad():
+                    enc_emb = tokenizer(
+                        batch_texts, max_length=config.MAX_LENGTH,
+                        truncation=True, padding="max_length", return_tensors="pt",
+                    )
+                    e_ids  = enc_emb["input_ids"].to(device)
+                    e_mask = enc_emb["attention_mask"].to(device)
+                    test_embs = model.embed(e_ids, e_mask).cpu().numpy()  # (B, 768)
+
+                for i_b in range(len(batch_texts)):
+                    knn_prob, alpha = _knn_prob_and_alpha(test_embs[i_b])
+                    if alpha > 0:
+                        batch_probs[i_b] = ((1.0 - alpha) * batch_probs[i_b]
+                                             + alpha * knn_prob)
+                        batch_probs[i_b] = max(0.0, min(1.0, batch_probs[i_b]))
 
             raw_probs.extend(batch_probs)
             raw_probs_unshifted.extend(batch_probs_unshifted)

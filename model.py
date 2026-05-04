@@ -51,6 +51,16 @@ class ClinicalBERTClassifier(nn.Module):
         pooled = _mean_pool(out.last_hidden_state, attention_mask)
         return self.classifier(self.dropout(pooled))
 
+    def embed(self, input_ids, attention_mask):
+        """
+        Returns the pre-classifier embedding (mean-pooled BERT). Used for
+        KNN-against-gold inference. Shape: (batch, hidden_size=768).
+        L2-normalized for direct cosine similarity.
+        """
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = _mean_pool(out.last_hidden_state, attention_mask)
+        return pooled / pooled.norm(dim=1, keepdim=True).clamp(min=1e-9)
+
     def unfreeze_top_layers(self, n: int = 4):
         for p in self.encoder.parameters():
             p.requires_grad = False

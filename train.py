@@ -174,11 +174,42 @@ def _load_gold():
     return df
 
 
-def train_model(pseudo_csv=None):
+def train_model(pseudo_csv=None,
+                seed_override: int | None = None,
+                checkpoint_name: str = "best_model.pt",
+                gold_train_per_class: int = 4,
+                unfreeze_top_n: int | None = None):
+    """
+    Train one model. For ensemble training, call this multiple times with
+    different (seed_override, checkpoint_name, gold_train_per_class,
+    unfreeze_top_n) to produce diverse models.
+
+    Args:
+        pseudo_csv: path to the pseudo-labeled CSV (default: config.PSEUDO_LABEL_CSV).
+        seed_override: if set, replaces config.RANDOM_SEED for this run.
+            Affects data shuffling, validation split, and weight init.
+        checkpoint_name: filename inside config.CHECKPOINTS to save best model.
+        gold_train_per_class: how many gold examples per class to put in the
+            training set (rest go to validation). Default 4 (=8 train, 12 val).
+        unfreeze_top_n: how many encoder layers to unfreeze in Phase 2.
+            Default None means use config.UNFREEZE_TOP_N.
+    """
     config.CHECKPOINTS.mkdir(exist_ok=True)
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Train] Device: {device}")
     tokenizer = load_tokenizer()
+
+    # Apply per-model overrides
+    seed = seed_override if seed_override is not None else config.RANDOM_SEED
+    n_unfreeze = unfreeze_top_n if unfreeze_top_n is not None else config.UNFREEZE_TOP_N
+    print(f"[Train] seed={seed}, checkpoint={checkpoint_name}, "
+          f"gold_train_per_class={gold_train_per_class}, unfreeze_top_n={n_unfreeze}")
+
+    # Set numpy/torch seeds for reproducibility within this run
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # ── Load data ─────────────────────────────────────────────────────────────
     gold_df = _load_gold()
@@ -188,7 +219,7 @@ def train_model(pseudo_csv=None):
     full_df["label"] = full_df["label"].astype(int)
     pseudo_df = full_df[~full_df["text"].isin(gold_text_set)].reset_index(drop=True)
     pseudo_df = pseudo_df.drop_duplicates(subset=["text"]).reset_index(drop=True)
-    pseudo_df = pseudo_df.sample(frac=1, random_state=config.RANDOM_SEED) \
+    pseudo_df = pseudo_df.sample(frac=1, random_state=seed) \
                           .reset_index(drop=True)
     print(f"[Train] Pseudo (non-gold, deduped): {len(pseudo_df):,} rows")
     print(f"[Train] Pseudo class balance — "
@@ -201,34 +232,28 @@ def train_model(pseudo_csv=None):
     pseudo_val   = pseudo_df.iloc[:n_val_pseudo].reset_index(drop=True)
     pseudo_train = pseudo_df.iloc[n_val_pseudo:].reset_index(drop=True)
 
-    # ROUND 4: stratified 8/12 split. The previous all-20-as-val approach
-    # gave good validation signal but starved the model of direct gold
-    # exposure. With our new BERT-mined neighbors providing more gold-like
-    # data already in training, adding a small amount of actual gold
-    # (8 examples × 3 oversample = 24 rows) should help direct calibration
-    # without dominating the loss like the original 50× oversampling did.
-    rng = np.random.RandomState(config.RANDOM_SEED)
+    # Stratified gold split: gold_train_per_class per class in training,
+    # rest in validation. Default 4/class → 8 train, 12 val.
+    rng = np.random.RandomState(seed)
     gold_idx_by_class = {c: list(gold_df.index[gold_df["label"]==c]) for c in (0, 1)}
     for c in gold_idx_by_class:
         rng.shuffle(gold_idx_by_class[c])
 
-    # 4 of each class → 8 in training; 6 of each → 12 in validation
     gold_val_idx, gold_tr_idx = [], []
     for c, idxs in gold_idx_by_class.items():
-        gold_tr_idx.extend(idxs[:4])
-        gold_val_idx.extend(idxs[4:])
+        gold_tr_idx.extend(idxs[:gold_train_per_class])
+        gold_val_idx.extend(idxs[gold_train_per_class:])
 
     gold_val   = gold_df.loc[gold_val_idx].reset_index(drop=True)
     gold_train = gold_df.loc[gold_tr_idx].reset_index(drop=True)
-    print(f"[Train] Gold split (round-4 stratified): "
-          f"train={len(gold_train)}, val={len(gold_val)}")
+    print(f"[Train] Gold split: train={len(gold_train)}, val={len(gold_val)}")
 
-    # Mild gold oversampling — 3× of 8 = 24 rows in training set
+    # Mild gold oversampling
     gold_oversample = int(getattr(config, "GOLD_OVERSAMPLE", 3))
     gold_repeated = pd.concat([gold_train] * gold_oversample, ignore_index=True)
 
     train_df = pd.concat([pseudo_train, gold_repeated], ignore_index=True)
-    train_df = train_df.sample(frac=1, random_state=config.RANDOM_SEED) \
+    train_df = train_df.sample(frac=1, random_state=seed) \
                        .reset_index(drop=True)
 
     print(f"[Train] Training set: {len(train_df):,} "
@@ -256,7 +281,7 @@ def train_model(pseudo_csv=None):
     else:
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    best_ckpt = config.CHECKPOINTS / "best_model.pt"
+    best_ckpt = config.CHECKPOINTS / checkpoint_name
     PATIENCE  = 4
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -301,9 +326,9 @@ def train_model(pseudo_csv=None):
     # ─────────────────────────────────────────────────────────────────────────
     # Phase 2: unfreeze top layers
     # ─────────────────────────────────────────────────────────────────────────
-    print(f"\n── Phase 2: fine-tune top {config.UNFREEZE_TOP_N} encoder layers ──")
+    print(f"\n── Phase 2: fine-tune top {n_unfreeze} encoder layers ──")
     model.load_state_dict(torch.load(best_ckpt, map_location=device))
-    model.unfreeze_top_layers(config.UNFREEZE_TOP_N)
+    model.unfreeze_top_layers(n_unfreeze)
     optim = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=config.PHASE2_LR, weight_decay=0.05)
@@ -360,7 +385,7 @@ def train_model(pseudo_csv=None):
                             gold_train["label"].tolist() * 5, tokenizer),
             batch_size=4, shuffle=True)
 
-        model.unfreeze_top_layers(config.UNFREEZE_TOP_N)
+        model.unfreeze_top_layers(n_unfreeze)
         for p in model.classifier.parameters():
             p.requires_grad = True
 
@@ -466,6 +491,32 @@ def train_model(pseudo_csv=None):
     g_acc, g_f1, _ = evaluate(model, tokenizer, gold_df["text"].tolist(),
                                gold_df["label"].tolist(), device, thr)
     print(f"[Train] Full gold @ tuned thr: acc={g_acc:.3f} f1={g_f1:.3f}")
+
+    # ── Save gold embeddings for KNN-against-gold inference (round 6) ──────
+    # Compute pre-classifier embeddings for ALL 20 gold examples and save them.
+    # predict.py loads these and does a KNN lookup at inference time to use
+    # gold information that the classifier alone might miss.
+    print("[Train] Computing & saving gold embeddings for KNN inference...")
+    model.eval()
+    all_gold_texts = gold_df["text"].tolist()
+    all_gold_labels = np.array(gold_df["label"].tolist(), dtype=int)
+    gold_embeds = []
+    with torch.no_grad():
+        bs = config.BATCH_SIZE
+        for start in range(0, len(all_gold_texts), bs):
+            batch = all_gold_texts[start: start + bs]
+            enc = tokenizer(batch, max_length=config.MAX_LENGTH,
+                            truncation=True, padding="max_length",
+                            return_tensors="pt")
+            ids  = enc["input_ids"].to(device)
+            mask = enc["attention_mask"].to(device)
+            emb = model.embed(ids, mask).cpu().numpy()
+            gold_embeds.append(emb)
+    gold_embeds = np.concatenate(gold_embeds, axis=0)   # (20, 768)
+    np.save(config.CHECKPOINTS / "gold_embeddings.npy", gold_embeds)
+    np.save(config.CHECKPOINTS / "gold_labels.npy", all_gold_labels)
+    print(f"[Train] Saved gold embeddings: shape={gold_embeds.shape} → "
+          f"{config.CHECKPOINTS / 'gold_embeddings.npy'}")
 
     return model
 
