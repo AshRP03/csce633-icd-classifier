@@ -1,30 +1,44 @@
-# CSCE 633 - ICD Codability Classifier
+# CSCE 633 — ICD Codability Classifier
 
-Binary text classifier that predicts whether a clinical text fragment (up to **128 words**) is "ICD-codable"—i.e., whether it contains medical information that an ICD coder could use to assign a diagnosis or procedure code.
+A course research project exploring text classification for clinical documentation. The model predicts whether a short clinical text fragment contains information that could support ICD coding.
 
-## Project Overview
+> **Status:** Completed academic project and learning artifact. The repository is public for educational and portfolio purposes. It is not a clinical tool and must not be used for medical or coding decisions.
 
-The classifier is trained on **~10k pseudo-labeled fragments** from MIMIC-III clinical notes, anchored on 20 hand-labeled gold examples. The data pipeline uses multiple labeling strategies:
-- **Regex-based sentence classification** on ICD vocabulary matches
-- **Section-anchored fragments** from discharge summaries (Discharge Diagnosis, PMH, etc.)
-- **Hard negative mining** via Bio_ClinicalBERT embeddings (fragments that look codable but contain disposition language)
+## What this project demonstrates
 
-## Model Architecture
+- Classical and neural text-classification workflow design
+- Dataset construction from weak and pseudo-labeling strategies
+- Domain-specific feature and hard-negative analysis
+- Transformer-based representation learning
+- Two-phase training and threshold-based inference
+- Reproducible experimentation and model artifact management
 
-Bio_ClinicalBERT encoder (`emilyalsentzer/Bio_ClinicalBERT`) with a trainable classification head:
+## Approach
 
+The project uses approximately 10,000 pseudo-labeled fragments derived from MIMIC-III clinical notes, anchored by a small set of hand-labeled examples. The data pipeline combines:
+
+- Regex-based classification using ICD vocabulary matches
+- Section-aware fragment extraction from discharge summaries and related sections
+- Hard-negative mining using Bio_ClinicalBERT embeddings
+
+The classifier uses `emilyalsెంటzer/Bio_ClinicalBERT` as a domain-specific encoder with a trainable classification head:
+
+```text
+Input text
+  → truncate to 128 words
+  → tokenize to at most 170 tokens
+  → Bio_ClinicalBERT encoder
+  → mean-pool 768-dimensional embeddings
+  → dropout
+  → linear 768 → 256 + GELU
+  → dropout
+  → linear 256 → 2
 ```
-Input → Truncate to 128 words → Tokenize (max 170 tokens)
-      → Bio_ClinicalBERT encoder (frozen initially)
-      → Mean-pool embeddings (768-dim)
-      → Dropout(0.3)
-      → Linear(768 → 256) → GELU → Dropout
-      → Linear(256 → 2) → CrossEntropyLoss
-```
 
-**Two-phase training:**
-1. Freeze encoder, train classification head only
-2. Unfreeze top encoder layers + fine-tune at lower learning rate
+Training is staged:
+
+1. Freeze the encoder and train the classification head.
+2. Unfreeze selected upper encoder layers and fine-tune with a lower learning rate.
 
 ## Setup
 
@@ -37,14 +51,24 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python main.py                # Full pipeline: data generation → training → inference
-python main.py --skip-data    # Reuse existing pseudo_labeled.csv (skip data pipeline)
-python main.py --predict-only # Inference only (requires saved checkpoint)
+# Generate data, train, and run inference
+python main.py
+
+# Reuse an existing pseudo_labeled.csv
+python main.py --skip-data
+
+# Run inference with an existing checkpoint
+python main.py --predict-only
 ```
 
-## Notes
+For offline environments, set `MODEL_PATH` to a local model directory as described in the source configuration.
 
-- Max input: 128 words (truncated if longer)
-- Fully offline inference; uses `MODEL_PATH` environment variable for custom model paths (required for offline clusters like Grace)
-- MIMIC-III data is excluded from this repo per course policy
-- Outputs: best model weights, decision threshold, and gold example embeddings for KNN-against-gold inference
+## Data and responsible use
+
+MIMIC-III data and other restricted artifacts are not included in this repository. Users must obtain access through the appropriate PhysioNet process and comply with the dataset license, credentialing, and data-use requirements.
+
+This project is an educational experiment in applied machine learning. It does not provide medical advice, assign official ICD codes, or replace qualified clinical coding review.
+
+## Project status
+
+This project is no longer under active development. It remains useful as a record of my earlier work in applied NLP, classification, weak supervision, domain-specific embeddings, and model evaluation.
